@@ -1,4 +1,6 @@
 .env
 test.py
 test2.py
+test3.py
 tempCodeRunnerFile.py
+__pycache__
