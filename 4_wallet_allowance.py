@@ -67,6 +67,7 @@ CTF         = Web3.to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA04760
 CTF_EX      = Web3.to_checksum_address("0xE111180000d2663C0091e4f400237545B87B996B")
 NR_EX       = Web3.to_checksum_address("0xe2222d279d744050d28e00520010520000310F59")
 NR_ADPT     = Web3.to_checksum_address("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296")
+USDC        = Web3.to_checksum_address("0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359")
 # Both adapter contracts are NOT on the relayer's approve allowlist:
 #   CTF_ADPT    = 0xADa100874d00e3331D00F2007a9c336a65009718 (CtfCollateralAdapter)
 #   NR_CTF_ADPT = 0xAdA200001000ef00D07553cEE7006808F895c6F1 (NegRiskCtfCollateralAdapter)
@@ -93,6 +94,7 @@ ERC1155_ABI = [
 ]
 
 w3     = Web3(Web3.HTTPProvider(RPC_URL))
+usdc_c = w3.eth.contract(address=USDC, abi=ERC20_ABI)
 pusd_c = w3.eth.contract(address=PUSD, abi=ERC20_ABI)
 ctf_c  = w3.eth.contract(address=CTF,  abi=ERC1155_ABI)
 
@@ -113,7 +115,9 @@ print(f"Deposit wallet : {DW}\n")
 print("Current allowances (from deposit wallet):")
 for label, addr in erc20_targets:
     val = pusd_c.functions.allowance(DW, addr).call()
+    val2 = usdc_c.functions.allowance(DW, addr).call()
     print(f"  pUSD → {label:<28}: {'✓' if val >= MAX_UINT256 else '✗'}")
+    print(f"  USDC → {label:<28}: {'✓' if val2 >= MAX_UINT256 else '✗'}")
 for label, addr in erc1155_targets:
     ok = ctf_c.functions.isApprovedForAll(DW, addr).call()
     print(f"  CTF  → {label:<28}: {'✓' if ok else '✗'}")
@@ -123,10 +127,15 @@ calls = []
 
 for label, addr in erc20_targets:
     val = pusd_c.functions.allowance(DW, addr).call()
+    val2 = usdc_c.functions.allowance(DW, addr).call()
     if val < MAX_UINT256:
         data = pusd_c.encode_abi("approve", args=[addr, MAX_UINT256])
         calls.append(DepositWalletCall(target=PUSD, value="0", data=data))
         print(f"  → queuing pUSD approve → {label}")
+    if val2 < MAX_UINT256:
+        data = usdc_c.encode_abi("approve", args=[addr, MAX_UINT256])
+        calls.append(DepositWalletCall(target=USDC, value="0", data=data))
+        print(f"  → queuing USDC approve → {label}")
 
 for label, addr in erc1155_targets:
     ok = ctf_c.functions.isApprovedForAll(DW, addr).call()

@@ -102,7 +102,7 @@ WSS_URL = "wss://ws-live-data.polymarket.com"
 GAMMA_API_URL = "https://gamma-api.polymarket.com/events?slug="
 
 # Set your filter here (e.g., "Weather")
-FILTER_TAG = "Crypto"
+FILTER_TAG = "Sports"
 
 # Cache to store slug -> tags mapping to avoid redundant API calls
 slug_cache = {}
@@ -183,6 +183,7 @@ async def monitor_global_bets():
                 print(f"Wallet: {wallet}")
                 print(f"Timestamp: {datetime.fromtimestamp(timestamp)}")
                 print(f"Tx: {p.get('transactionHash')}")
+                print(f"Slug: {event_slug}")
                 print("-" * 50)
 
             except json.JSONDecodeError:
