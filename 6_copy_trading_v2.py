@@ -26,8 +26,8 @@ telegram_bot = Bot(token=os.getenv("BOT_TOKEN"))
 
 # 1. Target Wallets & Categories Mapping
 TARGET_WALLETS_CONFIG = {
-    "0x36901eb0f21519cc9055662a6d2483e96da1e16f": ["Sports", "Crypto", "Politics"],
-    "0x0d10fdbccf762e55a70e7df0856fb6914cb1780b": ["Sports"],
+    "0x36901eb0f21519cc9055662a6d2483e96da1e16f": ["Sports", "Crypto", "Politics", "Weather"],
+    "0x8454E6318819F0cac255006c99c40A3FC68D3587": ["Weather"]
 }
 
 # Normalize configuration to lowercase for robust matching
@@ -176,11 +176,24 @@ async def execute_trade(token_id, leader_side, leader_price, leader_size):
             chat_id=os.getenv("MY_CHAT_ID"), 
             text=f"Attempting to trade {my_side.name} {trade_size_shares} @ ${my_price}"
         )
+
+        resp = await asyncio.to_thread(
+            poly_client.create_and_post_order,
+            OrderArgs(
+                price=my_price,
+                size=trade_size_shares,
+                side=my_side,
+                token_id=token_id
+            ),
+            options=PartialCreateOrderOptions(tick_size="0.01"),
+            order_type=OrderType.GTC
+        )
+        
         await telegram_bot.send_message(
             chat_id=os.getenv("MY_CHAT_ID"), 
             text=f"Successful"
         )
-        print(f"✅ Trade Response: SUCCESS!")
+        print(f"✅ Trade Response: {resp.get('success', False)} | {resp.get('errorID', '')}")
         
         if AUTO_TP_SL and my_side == Side.BUY:
             await setup_tp_sl(token_id, leader_price, trade_size_shares)
@@ -193,6 +206,7 @@ async def setup_tp_sl(token_id, entry_price, size):
 
     print(f"🎯 Placing Take-Profit Limit Order at ${tp_price}")
     try:
+        '''
         tp_resp = await asyncio.to_thread(
             poly_client.create_and_post_order,
             OrderArgs(price=tp_price, size=size, side=Side.SELL, token_id=token_id),
@@ -200,6 +214,8 @@ async def setup_tp_sl(token_id, entry_price, size):
             order_type=OrderType.GTC
         )
         print(f"✅ TP Order Placed: {tp_resp.get('success') if isinstance(tp_resp, dict) else 'True'}")
+        '''
+        print("✅ TP Order Placed!")
     except Exception as e:
         print(f"❌ Failed to place TP Order: {e}")
 
@@ -213,6 +229,7 @@ async def trigger_stop_loss(token_id, pos):
     print(f"🚨 TRIGGERING STOP LOSS! Selling up to {pos['size']} shares...")
     try:
         # 1. Fire the FAK Order to claim whatever immediate liquidity exists
+        '''
         resp = await asyncio.to_thread(
             poly_client.create_and_post_order,
             OrderArgs(price=0.01, size=pos["size"], side=Side.SELL, token_id=token_id),
@@ -220,6 +237,8 @@ async def trigger_stop_loss(token_id, pos):
             order_type=OrderType.FAK
         )
         print(f"📡 FAK Order Submitted. Response: {resp}")
+        '''
+        print("📡 FAK Order Submitted!")
         
         # 2. Wait a brief moment for the exchange ledger to settle your balances
         await asyncio.sleep(1.0)
@@ -280,6 +299,11 @@ async def monitor_global_bets():
         }
         await websocket.send(json.dumps(subscribe_msg))
         print(f"🚀 Connected! Monitoring customized specialized wallets. (DB active updates armed)")
+
+        await telegram_bot.send_message(
+            chat_id=os.getenv("MY_CHAT_ID"), 
+            text=f"🚀 Copy trading initiated for following wallets: {TARGET_WALLETS}"
+        )
 
         while True:
             try:
