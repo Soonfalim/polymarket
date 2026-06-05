@@ -1,7 +1,7 @@
 import os
 from eth_account import Account #pip install web3 eth_account
-from py_clob_client.client import ClobClient #pip install py-clob-client
-from py_clob_client.clob_types import ApiCreds
+from py_clob_client_v2.client import ClobClient #pip install py-clob-client
+from py_clob_client_v2.clob_types import ApiCreds
 
 # 1. Create a new Ethereum Account
 def create_eth_account():
@@ -49,5 +49,4 @@ if __name__ == "__main__":
     polymarket_creds = link_to_polymarket(my_new_wallet)
     
     if polymarket_creds:
-        print("\nSuccess! Account created and linked.")
-        print("Note: You must fund the address above with USDC.e on Polygon to trade.")
+        print("\nSuccess! Account created.")

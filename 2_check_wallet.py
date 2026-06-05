@@ -1,82 +1,3 @@
-'''
-import os
-from decimal import Decimal
-from dotenv import load_dotenv
-
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, BalanceAllowanceParams, AssetType
-from py_clob_client.constants import POLYGON
-
-# Load environment variables from .env file
-load_dotenv()
-
-def get_polymarket_balance():
-    # 1. Setup Credentials
-    # Ensure these match your .env file keys
-    creds = ApiCreds(
-        api_key=os.getenv("POLY_API_KEY"),
-        api_secret=os.getenv("POLY_API_SECRET"),
-        api_passphrase=os.getenv("POLY_API_PASSPHRASE"),
-    )
-    
-    # 2. Initialize Client
-    client = ClobClient(
-        host="https://clob.polymarket.com",
-        key=os.getenv('EVM_PRIVATE'), 
-        chain_id=POLYGON,
-        creds=creds
-    )
-
-    try:
-        # 3. Fetch Balance Information
-        # AssetType.COLLATERAL refers to the USDC used for trading
-        balance_info = client.get_balance_allowance(
-            params=BalanceAllowanceParams(
-                asset_type=AssetType.COLLATERAL
-            )
-        )
-
-        if balance_info:
-            # Polymarket returns balance as a string in base units (e.g., "1000000" for 1 USDC)
-            raw_balance = balance_info.get("balance", "0")
-            
-            # Convert to Decimal for high precision
-            # USDC has 6 decimals on Polygon
-            usdc_balance = Decimal(raw_balance) / Decimal("1000000")
-            
-            # Also check allowance (spending permission)
-            raw_allowance = balance_info.get("allowance", "0")
-            allowance = Decimal(raw_allowance) / Decimal("1000000")
-
-            print("--- Polymarket Wallet Status ---")
-            print(f"USDC Balance:   {usdc_balance} USDC")
-            print(f"CLOB Allowance: {allowance} USDC")
-            
-            if allowance < usdc_balance:
-                print("\nNote: Your allowance is lower than your balance.")
-                print("You may need to approve the CLOB contract to spend your USDC.")
-            
-            return usdc_balance
-        
-    except Exception as e:
-        print(f"An error occurred: {e}")
-        return None
-
-if __name__ == "__main__":
-    balance = get_polymarket_balance()
-'''
-
-"""
-1_rpc.py — RPC smoke test: EOA USDC.e balance + deposit wallet pUSD balance.
-
-Run:
-    python 1_rpc.py
-
-Requires: PRIVATE_KEY in .env. Set DEPOSIT_WALLET after running 2_deploy_wallet.py.
-The deposit wallet holds pUSD. EOA holds USDC.e for funding. No MATIC needed —
-the relayer pays all gas.
-"""
-
 import os
 
 from dotenv import load_dotenv
@@ -137,6 +58,6 @@ if DEPOSIT_WALLET:
     print(f"USDC.e  (wallet) : {usdc_dw / 1e6:.6f}")
     print(f"USDC    (wallet) : {usdc__dw / 1e6:.6f}")
 else:
-    print("\nDEPOSIT_WALLET not set in .env — run 2_deploy_wallet.py first")
+    print("\nDEPOSIT_WALLET not set in .env")
 
-print("\nRPC smoke test complete ✓")
+print("\nCheck wallet complete ✓")

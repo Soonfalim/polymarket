@@ -1,7 +1,7 @@
 import requests
 
 # Replace with your target Polymarket wallet address
-TARGET_WALLET = "0x7f3c8979d0afa00007bae4747d5347122af05613"
+TARGET_WALLET = "0x51C2059Cef7D809E7F915d8a36517f19c060A259"
 
 def print_current_positions(wallet_address):
     """
@@ -38,6 +38,7 @@ def print_current_positions(wallet_address):
             current_value = pos.get("currentValue", 0)
             pnl = pos.get("cashPnl", 0)
             pnl_percent = pos.get("percentPnl", 0)
+            asset = pos.get("asset")
 
             print(f"[{index}] {title}")
             print(f"    • Outcome Bet:   {outcome}")
@@ -45,6 +46,7 @@ def print_current_positions(wallet_address):
             print(f"    • Avg Price:     ${avg_price:.2f} | Current Price: ${cur_price:.2f}")
             print(f"    • Total Value:   ${current_value:.2f}")
             print(f"    • Cash PnL:      ${pnl:.2f} ({pnl_percent:.2f}%)")
+            print(f"    • Asset ID:      {asset}")
             print("-" * 50)
             
     except requests.exceptions.RequestException as e:
@@ -107,6 +109,6 @@ def print_closed_positions(wallet_address):
             print(f"Error fetching closed positions: {e}")
 
 if __name__ == "__main__":
-    #print_current_positions(TARGET_WALLET)
+    print_current_positions(TARGET_WALLET)
     
-    print_closed_positions(TARGET_WALLET)
+    #print_closed_positions(TARGET_WALLET)

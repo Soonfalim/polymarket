@@ -1,139 +1,118 @@
-import os
-import re
-import json
 import requests
-from openai import OpenAI
+import json
+from duckduckgo_search import DDGS
+import os
 from dotenv import load_dotenv
-
 load_dotenv()
 
-# Initialize the OpenAI Client
-# It will automatically look for the OPENAI_API_KEY environment variable.
-client = OpenAI()
+# Configuration
+POLYMARKET_GAMMA_API = "https://gamma-api.polymarket.com/markets"
 
-def safe_parse(data):
-    """Polymarket API sometimes returns JSON strings and sometimes lists. This handles both."""
-    if isinstance(data, str):
-        try:
-            return json.loads(data)
-        except json.JSONDecodeError:
-            return []
-    return data or []
+# Get a FREE API key from Google AI Studio (https://aistudio.google.com/)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
 
-def fetch_polymarket_data(url):
-    """Extracts the event slug from the URL and fetches live data from the Gamma API."""
-    match = re.search(r'/event/([^/?]+)', url)
-    if not match:
-        raise ValueError("Invalid Polymarket URL. Ensure it contains '/event/slug'")
-    
-    slug = match.group(1)
-    
-    # Polymarket's public API for event data
-    api_url = f"https://gamma-api.polymarket.com/events?slug={slug}"
-    headers = {"Accept": "application/json"}
-    
-    response = requests.get(api_url, headers=headers)
-    response.raise_for_status()
-    
-    data = response.json()
-    if not data:
-        raise ValueError(f"No active data found for market slug: {slug}")
-        
-    return data[0]
-
-def analyze_market_with_ai(url):
-    print(f"Fetching live data for: {url}...")
-    
+def fetch_polymarket_market(slug):
+    """Fetches target market data from Polymarket (Free & Public)."""
     try:
-        event_data = fetch_polymarket_data(url)
+        response = requests.get(f"{POLYMARKET_GAMMA_API}?slug={slug}")
+        if response.status_code == 200 and response.json():
+            market_data = response.json()[0]
+            prices = json.loads(market_data.get("outcomePrices", "[]"))
+            
+            return {
+                "title": market_data.get("title"),
+                "resolution_rules": market_data.get("resolutionCriteria"),
+                "yes_price": float(prices[0]) if prices else None
+            }
     except Exception as e:
         print(f"Error fetching Polymarket data: {e}")
-        return None, None
+    return None
 
-    # Parse relevant market data to feed into the LLM context window
-    title = event_data.get('title', 'Unknown Title')
-    description = event_data.get('description', 'No description available.')
-    markets = event_data.get('markets', [])
+def fetch_free_news(query):
+    """Fetches the latest web data using DuckDuckGo (100% Free, No Key)."""
+    try:
+        print(f"Searching the live web for: '{query}'...")
+        with DDGS() as ddgs:
+            # Get the top 5 latest text results from the web
+            results = [r['body'] for r in ddgs.text(query, max_results=5)]
+            return "\n".join(results)
+    except Exception as e:
+        print(f"Failed to fetch live news: {e}")
+        return "No recent news context available."
+
+def analyze_with_free_ai(market_info, context_data):
+    """Uses Gemini's free tier to analyze the market and return JSON."""
     
-    market_summaries = []
-    for market in markets:
-        question = market.get('question', '')
-        outcomes = safe_parse(market.get('outcomes', '[]'))
-        prices = safe_parse(market.get('outcomePrices', '[]'))
-        
-        # Map each outcome to its current price/probability (e.g., {"Yes": "0.45", "No": "0.55"})
-        outcome_data = {outcomes[i]: prices[i] for i in range(min(len(outcomes), len(prices)))}
-        market_summaries.append({
-            "market_question": question,
-            "current_odds": outcome_data
-        })
-
-    # Construct the Prompt
-    # We explicitly ask the model to output a strict JSON schema so we can extract the variables.
     prompt = f"""
-    You are an expert prediction market analyst. Analyze the following live Polymarket event.
+    You are an expert prediction market analyst. 
+    Analyze the following Polymarket contract and the recent real-world data provided.
     
-    Event Title: {title}
-    Description: {description}
-    Markets and Current Odds: {json.dumps(market_summaries, indent=2)}
+    Market: {market_info['title']}
+    Rules: {market_info['resolution_rules']}
+    Current Market Price for YES: ${market_info['yes_price']} (implies a {market_info['yes_price']*100}% chance)
     
-    Provide a detailed analysis of the market conditions. Based on general knowledge, statistics, and the current odds, give fundamental reasons explaining why a trader should either 'hold', 'sell', or 'buy' each specific outcome.
+    Recent Live Web Context:
+    {context_data}
     
-    You must return your response in strict JSON format matching this exact schema:
-    {{
-        "analysis_text": "Your detailed explanation and analysis goes here...",
-        "decisions": {{
-            "Outcome 1 (e.g., Yes)": "buy",
-            "Outcome 2 (e.g., No)": "sell",
-            "Outcome 3 (if applicable)": "hold"
-        }}
-    }}
+    Based strictly on the data, what is the actual mathematical probability (0.0 to 1.0) that this resolves to YES?
+    You must reply ONLY with a raw JSON object. Do not include markdown formatting like ```json. 
+    Format: {{"estimated_probability": 0.75, "reasoning": "your short explanation"}}
     """
-
-    print("Requesting AI analysis...\n")
     
-    # Call OpenAI (using JSON Object response format to guarantee variable parsing)
-    response = client.chat.completions.create(
-        model="gpt-4o", 
-        response_format={ "type": "json_object" },
-        messages=[
-            {"role": "system", "content": "You are a data-driven financial AI. You always output valid JSON."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.7
-    )
-
-    # Parse the LLM's JSON response
-    ai_output = json.loads(response.choices[0].message.content)
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}]
+    }
     
-    analysis = ai_output.get("analysis_text", "No analysis provided.")
-    decision_variable = ai_output.get("decisions", {})
-
-    # 1. Print out the analysis
-    print("=" * 60)
-    print("📈 AI MARKET ANALYSIS")
-    print("=" * 60)
-    print(analysis)
-    print("=" * 60)
-    
-    # 2. Return the parsed outputs so the broader script can use the decision variable
-    return analysis, decision_variable
-
-# --- Execution Block ---
-if __name__ == "__main__":
-    # Replace this with the Polymarket link you have
-    polymarket_url = "https://polymarket.com/event/highest-temperature-in-tel-aviv-on-may-26-2026/highest-temperature-in-tel-aviv-on-may-26-2026-26c"
-    
-    if not os.getenv("OPENAI_API_KEY"):
-        print("ERROR: OPENAI_API_KEY environment variable is not set.")
-    else:
-        # Run the analysis
-        final_analysis, ai_decisions = analyze_market_with_ai(polymarket_url)
+    try:
+        response = requests.post(GEMINI_API_URL, json=payload, headers={"Content-Type": "application/json"})
+        result = response.json()
         
-        if ai_decisions:
-            print("\n⚙️  SCRIPT VARIABLE SET: 'ai_decisions'")
-            print(json.dumps(ai_decisions, indent=2))
-            
-            # Example of how you would use this variable later in your script:
-            # if ai_decisions.get("Yes") == "buy":
-            #     execute_buy_order("Yes")
+        # Extract text response from Gemini's structure
+        raw_text = result['candidates'][0]['content']['parts'][0]['text'].strip()
+        
+        # Parse it into a python dictionary
+        analysis = json.loads(raw_text)
+        return analysis
+    except Exception as e:
+        print(f"AI Analysis failed: {e}")
+        return None
+
+def evaluate_trading_edge(slug, min_edge=0.05):
+    """Calculates your mathematical edge for $0 cost."""
+    market = fetch_polymarket_market(slug)
+    if not market or market['yes_price'] is None:
+        print("Could not retrieve valid market data.")
+        return
+
+    # 1. Gather 100% free live web data
+    context = fetch_free_news(market['title'])
+    
+    # 2. Get Free AI analysis
+    ai_analysis = analyze_with_free_ai(market, context)
+    if not ai_analysis:
+        return
+        
+    p_ai = ai_analysis["estimated_probability"]
+    p_market = market["yes_price"]
+    edge = p_ai - p_market
+    
+    print(f"\n--- Free AI Analysis Results ---")
+    print(f"Market Price (Implied): {p_market*100:.1f}%")
+    print(f"AI Estimated Price:     {p_ai*100:.1f}%")
+    print(f"Calculated Edge:        {edge*100:+.1f}%")
+    print(f"AI Reasoning: {ai_analysis['reasoning']}")
+    
+    # 3. Output Trade Signal
+    if edge >= min_edge:
+        print(f"🚀 SIGNAL: BUY YES. Market underpricing by {edge*100:.1f}%.")
+    elif edge <= -min_edge:
+        print(f"📉 SIGNAL: BUY NO. Market overpricing by {abs(edge)*100:.1f}%.")
+    else:
+        print("⏸️ SIGNAL: NO EDGE. Market is efficient.")
+
+# Example Usage
+if __name__ == "__main__":
+    # Paste an active market slug here (the end part of a Polymarket URL)
+    example_slug = "will-bitcoin-hit-100k-in-2026" 
+    evaluate_trading_edge(example_slug)
