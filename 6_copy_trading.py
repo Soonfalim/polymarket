@@ -1,6 +1,7 @@
 import os
 import asyncio
 import websockets
+import requests
 import json
 import httpx
 from datetime import datetime
@@ -40,10 +41,10 @@ FIXED_AMOUNT = 5.0   # Buy exactly $5 pUSD per trade
 PERCENTAGE = 15.0    # If mode is PERCENTAGE, buy 15% of the leader's trade size
 
 # 3. Maximum Copy $ Amount (Hard cap per trade in pUSD)
-MAX_COPY_AMOUNT = 50.0
+MAX_COPY_AMOUNT = 9.0
 
 # 4. Price Range Filter (Inclusive)
-PRICE_MIN = 0.40
+PRICE_MIN = 0.10
 PRICE_MAX = 0.95
 
 # 5. Slippage Tolerance (0.01 = 1% price movement accepted)
@@ -53,13 +54,13 @@ SLIPPAGE_TOLERANCE = 0.01
 ENABLE_TAKE_PROFIT = False
 ENABLE_STOP_LOSS = False
 
-TP_PERCENTAGE = 0.20     # 20% gain
-SL_PERCENTAGE = 0.10     # 10% loss
+TP_PERCENTAGE = 0.90     # 20% gain
+SL_PERCENTAGE = 0.50     # 10% loss
 
 SL_CHECK_INTERVAL = 3    # seconds
 SLIPPAGE_EXIT_BUFFER = 0.02  # extra aggressiveness on exits
 
-PAPER_TRADE = False
+PAPER_TRADE = True
 
 # ==========================================
 # ENDPOINTS & PERSISTENT STATE STORAGE
@@ -67,6 +68,7 @@ PAPER_TRADE = False
 
 WSS_URL = "wss://ws-live-data.polymarket.com"
 GAMMA_API_URL = "https://gamma-api.polymarket.com/events?slug="
+POSITIONS_URL = "https://data-api.polymarket.com/positions"
 CLOB_HOST = "https://clob.polymarket.com"
 DB_FILE = "active_positions.json"  # Persistent local state database
 
@@ -84,9 +86,52 @@ def load_active_positions():
             print(f"💾 Database: Loaded {len(active_positions)} active position trackers from {DB_FILE}")
         except Exception as e:
             print(f"⚠️ Database Error: Failed to parse storage file, starting clean: {e}")
-            active_positions = {}
-    else:
-        active_positions = {}
+    
+    # Query parameters based on the API specification
+    params = {
+        "user": os.getenv("DEPOSIT_WALLET"),
+        "sizeThreshold": 1,       # Only show positions with a meaningful size
+        "limit": 500,             # Number of positions to return per request (max 500)
+        "sortBy": "TOKENS",
+        "sortDirection": "DESC"
+    }
+    
+    try:
+        response = requests.get(POSITIONS_URL, params=params)
+        response.raise_for_status()
+        positions = response.json()
+        
+        if not positions:
+            print(f"No current active positions found for wallet: {os.getenv('DEPOSIT_WALLET')}")
+            return
+        
+        for pos in positions:
+            #title = pos.get("title", "Unknown Market")
+            #outcome = pos.get("outcome", "N/A")
+            size = pos.get("size", 0)
+            avg_price = pos.get("avgPrice", 0)
+            #cur_price = pos.get("curPrice", 0)
+            #current_value = pos.get("currentValue", 0)
+            #pnl = pos.get("cashPnl", 0)
+            #pnl_percent = pos.get("percentPnl", 0)
+            asset = pos.get("asset")
+
+            tp_price = min(0.99, round(avg_price * (1 + TP_PERCENTAGE), 2))
+            sl_price = max(0.01, round(avg_price * (1 - SL_PERCENTAGE), 2))
+
+            position_data = {
+                "size": size,
+                "entry_price": avg_price,
+                "total": size * avg_price,
+                "tp_price": tp_price,
+                "sl_price": sl_price,
+            }
+
+            active_positions[asset] = position_data
+            save_active_positions()
+
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching positions: {e}")
 
 def save_active_positions():
     """Commits current tracking configuration safely to disk."""
@@ -189,53 +234,71 @@ async def execute_trade(token_id, leader_side, leader_price, leader_size):
             text=f"Attempting to trade {my_side.name} {trade_size_shares} @ ${my_price}"
         )
     
-    try:
-        if not PAPER_TRADE:
-            resp = await asyncio.to_thread(
-                poly_client.create_and_post_order,
-                OrderArgs(
-                    price=my_price,
-                    size=trade_size_shares,
-                    side=my_side,
-                    token_id=token_id
-                ),
-                options=PartialCreateOrderOptions(tick_size="0.01"),
-                order_type=OrderType.FOK  # Changed from OrderType.GTC
+    current_total = active_positions.get(token_id, {}).get("total", 0.0)
+
+    if current_total < 9:
+        try:
+            if not PAPER_TRADE:
+                resp = await asyncio.to_thread(
+                    poly_client.create_and_post_order,
+                    OrderArgs(
+                        price=my_price,
+                        size=trade_size_shares,
+                        side=my_side,
+                        token_id=token_id
+                    ),
+                    options=PartialCreateOrderOptions(tick_size="0.01"),
+                    order_type=OrderType.FOK  # Changed from OrderType.GTC
+                )
+
+                print(f"✅ Trade Response: {resp.get('success', False)} | {resp.get('errorID', '')}")
+            else:
+                print(f"✅ Trade Response: Successful!")
+            
+            await telegram_bot.send_message(
+                chat_id=os.getenv("MY_CHAT_ID"), 
+                text=f"Successful"
             )
 
-            print(f"✅ Trade Response: {resp.get('success', False)} | {resp.get('errorID', '')}")
-        else:
-            print(f"✅ Trade Response: Successful!")
-        
-        await telegram_bot.send_message(
-            chat_id=os.getenv("MY_CHAT_ID"), 
-            text=f"Successful"
-        )
-        
-        if (ENABLE_TAKE_PROFIT or ENABLE_STOP_LOSS) and my_side == Side.BUY:
-            await setup_tp_sl(token_id, my_price, trade_size_shares)
-    except Exception as e:
-        print(f"❌ Execution Failed: {e}")
+            if token_id not in active_positions:
+                tp_price = min(0.99, round(my_price * (1 + TP_PERCENTAGE), 2))
+                sl_price = max(0.01, round(my_price * (1 - SL_PERCENTAGE), 2))
 
-async def setup_tp_sl(token_id, entry_price, size):
-    tp_price = min(0.99, round(entry_price * (1 + TP_PERCENTAGE), 2))
-    sl_price = max(0.01, round(entry_price * (1 - SL_PERCENTAGE), 2))
+                active_positions[token_id] = {
+                    "size": trade_size_shares,
+                    "entry_price": my_price,
+                    "total": trade_size_shares * my_price,
+                    "tp_price": tp_price,
+                    "sl_price": sl_price,
+                    "status": "OPEN",           # Required for your SL monitor!
+                    "sl_enabled": ENABLE_STOP_LOSS # Required for your SL monitor!
+                }
+            else:
+                old_size = active_positions[token_id]["size"]
+                old_entry = active_positions[token_id]["entry_price"]
+                
+                new_size = old_size + trade_size_shares
+                new_entry_price = ((old_size * old_entry) + (trade_size_shares * my_price)) / new_size
 
-    position_data = {
-        "size": size,
-        "entry_price": entry_price,
-        "tp_price": tp_price,
-        "sl_price": sl_price,
-        "tp_enabled": ENABLE_TAKE_PROFIT,
-        "sl_enabled": ENABLE_STOP_LOSS,
-        "tp_order_id": None,
-        "status": "OPEN"
-    }
+                active_positions[token_id]["size"] = new_size
+                active_positions[token_id]["entry_price"] = round(new_entry_price, 4)
+                active_positions[token_id]["total"] = new_size * new_entry_price
+                active_positions[token_id]["tp_price"] = min(0.99, round(new_entry_price * (1 + TP_PERCENTAGE), 2))
+                active_positions[token_id]["sl_price"] = max(0.01, round(new_entry_price * (1 - SL_PERCENTAGE), 2))
 
+            save_active_positions()
+
+            if (ENABLE_TAKE_PROFIT or ENABLE_STOP_LOSS) and my_side == Side.BUY:
+                await setup_tp_sl(token_id, active_positions[token_id]["tp_price"], trade_size_shares)
+        except Exception as e:
+            print(f"❌ Execution Failed: {e}")
+    else:
+        print("Cancelling trade order, limit for market reached!")
+
+async def setup_tp_sl(token_id, tp_price, size):
     # ==========================================
     # TAKE PROFIT
     # ==========================================
-
     if ENABLE_TAKE_PROFIT:
         try:
             tp_resp = await asyncio.to_thread(
@@ -250,10 +313,7 @@ async def setup_tp_sl(token_id, entry_price, size):
                 order_type=OrderType.GTC
             )
 
-            print(f"✅ TP order placed at {tp_price}")
-
-            if isinstance(tp_resp, dict):
-                position_data["tp_order_id"] = tp_resp.get("orderID")
+            print(f"✅ TP order placed at {tp_price}: {tp_resp.get('success', False)}")
 
         except Exception as e:
             print(f"❌ Failed to place TP order: {e}")
@@ -263,10 +323,7 @@ async def setup_tp_sl(token_id, entry_price, size):
     # ==========================================
 
     if ENABLE_STOP_LOSS:
-        print(f"🛡️ Stop loss armed at {sl_price}")
-
-    active_positions[token_id] = position_data
-    save_active_positions()
+        print(f"🛡️ Stop loss armed")
 
 async def monitor_stop_losses():
     """
@@ -498,7 +555,8 @@ async def monitor_global_bets():
                 continue
             except Exception as e:
                 print(f"⚠️ Connection Lost: {e}")
-                break
+                continue
+                #break
 
 if __name__ == "__main__":
     # Initialize the local data cache before runtime thread initialization

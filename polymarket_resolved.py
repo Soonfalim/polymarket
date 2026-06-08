@@ -72,9 +72,9 @@ async def monitor_market_resolutions():
                 slug = event_msg.get("slug", "N/A")
                 tags = data.get("tags", [])
                 # --- Formatting and Printing ---
-                print(f"🏁 Market Resolved!")
-                print(f"📈 Title: {title}")
-                print(f"✨ Winning Outcome: {winning_outcome}")
+                print(f"Market Resolved!")
+                print(f"Title: {title}")
+                print(f"Winning Outcome: {winning_outcome}")
                 print(f"Winner Asset ID: {winning_asset_id}")
                 print(f"Condition ID: {condition_id}")
                 print(f"Timestamp: {timestamp}")
@@ -82,17 +82,17 @@ async def monitor_market_resolutions():
                 if slug != "N/A":
                     print(f"Slug: {slug}")
                 if tags:
-                    print(f"🏷️ Tags: {', '.join(tags)}")
+                    print(f"Tags: {', '.join(tags)}")
                     
                 print("-" * 50)
 
             except json.JSONDecodeError:
                 continue
             except websockets.ConnectionClosed:
-                print("⚠️ Connection Closed by Server.")
+                print("Connection Closed by Server.")
                 break
             except Exception as e:
-                print(f"⚠️ Error: {e}")
+                print(f"Error: {e}")
                 break
 
 if __name__ == "__main__":
