@@ -29,7 +29,7 @@ telegram_bot = Bot(token=os.getenv("BOT_TOKEN"))
 TARGET_WALLETS_CONFIG = {
     "0x36901eb0f21519cc9055662a6d2483e96da1e16f": ["Sports", "Crypto", "Politics"],
     "0x81f80ba4769f17d270f0585ea546f2ed942e8ba9": ["Weather"],
-    "0xba016b05c84c9f073e5c9059d247d37cea4b8535": ["Crypto"]
+    "0xba016b05c84c9f073e5c9059d247d37cea4b8535": ["Crypto"],
 }
 
 # Normalize configuration to lowercase for robust matching
@@ -41,18 +41,18 @@ FIXED_AMOUNT = 5.0   # Buy exactly $5 pUSD per trade
 PERCENTAGE = 15.0    # If mode is PERCENTAGE, buy 15% of the leader's trade size
 
 # 3. Maximum Copy $ Amount (Hard cap per trade in pUSD)
-MAX_COPY_AMOUNT = 9.0
+MAX_COPY_AMOUNT = 13.0
 
 # 4. Price Range Filter (Inclusive)
-PRICE_MIN = 0.10
-PRICE_MAX = 0.95
+PRICE_MIN = 0.45
+PRICE_MAX = 0.96
 
 # 5. Slippage Tolerance (0.01 = 1% price movement accepted)
 SLIPPAGE_TOLERANCE = 0.01
 
 # 6. Automatic Take Profit & Stop Loss
-ENABLE_TAKE_PROFIT = False
-ENABLE_STOP_LOSS = False
+ENABLE_TAKE_PROFIT = True
+ENABLE_STOP_LOSS = True
 
 TP_PERCENTAGE = 0.90     # 20% gain
 SL_PERCENTAGE = 0.50     # 10% loss
@@ -180,33 +180,10 @@ async def fetch_and_cache_gamma_data(client, event_slug):
                 tags = [tag.get("label", "").lower() for tag in event_data.get("tags", [])]
                 event_cache[event_slug] = tags
                 
-                '''
-                markets = event_data.get("markets", [])
-                for m in markets:
-                    m_slug = m.get("slug")
-                    outcomes = m.get("outcomes", [])
-                    token_ids = m.get("clobTokenIds", [])
-                    
-                    mapping = {}
-                    for i, out in enumerate(outcomes):
-                        if i < len(token_ids):
-                            mapping[str(out).lower()] = token_ids[i]
-                    
-                    market_cache[m_slug] = mapping
-                
-                    '''
                 return tags
     except Exception as e:
         print(f"⚠️ API Error fetching data for slug {event_slug}: {e}")
     return []
-
-'''
-async def get_token_id_from_gamma(client, event_slug, market_slug, outcome):
-    if market_slug in market_cache:
-        return market_cache[market_slug].get(str(outcome).lower())
-    await fetch_and_cache_gamma_data(client, event_slug)
-    return market_cache.get(market_slug, {}).get(str(outcome).lower())
-'''
 
 async def execute_trade(token_id, leader_side, leader_price, leader_size):
     if not poly_client:
@@ -285,21 +262,25 @@ async def execute_trade(token_id, leader_side, leader_price, leader_size):
                 active_positions[token_id]["total"] = new_size * new_entry_price
                 active_positions[token_id]["tp_price"] = min(0.99, round(new_entry_price * (1 + TP_PERCENTAGE), 2))
                 active_positions[token_id]["sl_price"] = max(0.01, round(new_entry_price * (1 - SL_PERCENTAGE), 2))
+                active_positions[token_id]["status"] = "OPEN" # Ensure state is explicitly set to open
 
             save_active_positions()
+            
+            if ENABLE_TAKE_PROFIT and my_side.name == "BUY":
+                await setup_tp(token_id, active_positions[token_id]["tp_price"], trade_size_shares)
+            if ENABLE_STOP_LOSS and my_side.name == "BUY":
+                await setup_sl(token_id, active_positions[token_id]["sl_price"], trade_size_shares)
 
-            if (ENABLE_TAKE_PROFIT or ENABLE_STOP_LOSS) and my_side == Side.BUY:
-                await setup_tp_sl(token_id, active_positions[token_id]["tp_price"], trade_size_shares)
         except Exception as e:
             print(f"❌ Execution Failed: {e}")
     else:
         print("Cancelling trade order, limit for market reached!")
 
-async def setup_tp_sl(token_id, tp_price, size):
+async def setup_tp(token_id, tp_price, size):
     # ==========================================
     # TAKE PROFIT
     # ==========================================
-    if ENABLE_TAKE_PROFIT:
+    if not PAPER_TRADE:
         try:
             tp_resp = await asyncio.to_thread(
                 poly_client.create_and_post_order,
@@ -317,143 +298,15 @@ async def setup_tp_sl(token_id, tp_price, size):
 
         except Exception as e:
             print(f"❌ Failed to place TP order: {e}")
+    else:
+        print(f"✅ TP order placed at {tp_price}")
 
+async def setup_sl(token_id, sl_price, size):
     # ==========================================
     # STOP LOSS REGISTRATION
     # ==========================================
+    print(f"🛡️ Stop loss armed")
 
-    if ENABLE_STOP_LOSS:
-        print(f"🛡️ Stop loss armed")
-
-async def monitor_stop_losses():
-    """
-    Dedicated loop that monitors prices independently
-    from websocket trade events.
-    """
-
-    while True:
-        try:
-            tokens_to_remove = []
-
-            for token_id, pos in active_positions.items():
-
-                if pos["status"] != "OPEN":
-                    continue
-
-                if not pos.get("sl_enabled", False):
-                    continue
-
-                try:
-                    book = await asyncio.to_thread(
-                        poly_client.get_order_book,
-                        token_id
-                    )
-
-                    bids = book.get("bids", [])
-
-                    if not bids:
-                        continue
-
-                    best_bid = float(bids[0]["price"])
-
-                    if best_bid <= pos["sl_price"]:
-
-                        print(
-                            f"🚨 STOP LOSS HIT for {token_id} "
-                            f"(bid={best_bid}, sl={pos['sl_price']})"
-                        )
-
-                        pos["status"] = "CLOSING"
-                        save_active_positions()
-
-                        asyncio.create_task(
-                            execute_stop_loss(token_id, pos, best_bid)
-                        )
-
-                except Exception as e:
-                    print(f"SL monitor error for {token_id}: {e}")
-
-            await asyncio.sleep(SL_CHECK_INTERVAL)
-
-        except Exception as e:
-            print(f"Global SL monitor error: {e}")
-            await asyncio.sleep(5)
-
-async def execute_stop_loss(token_id, pos, best_bid):
-    try:
-        exit_price = max(
-            0.01,
-            round(best_bid - SLIPPAGE_EXIT_BUFFER, 2)
-        )
-
-        print(
-            f"📉 Executing stop loss exit "
-            f"{pos['size']} @ {exit_price}"
-        )
-
-        resp = await asyncio.to_thread(
-            poly_client.create_and_post_order,
-            OrderArgs(
-                price=exit_price,
-                size=pos["size"],
-                side=Side.SELL,
-                token_id=token_id
-            ),
-            options=PartialCreateOrderOptions(
-                tick_size="0.01"
-            ),
-            order_type=OrderType.FAK
-        )
-
-        print(f"📡 SL Response: {resp}")
-
-        await asyncio.sleep(1)
-
-        from py_clob_client_v2 import (
-            BalanceAllowanceParams,
-            AssetType
-        )
-
-        params = BalanceAllowanceParams(
-            asset_type=AssetType.CONDITIONAL,
-            token_id=token_id
-        )
-
-        ba = await asyncio.to_thread(
-            poly_client.get_balance_allowance,
-            params
-        )
-
-        remaining_balance = float(ba.get("balance", 0))
-
-        print(f"Remaining balance: {remaining_balance}")
-
-        if remaining_balance <= 0.01:
-
-            print("✅ Position fully closed.")
-
-            if token_id in active_positions:
-                del active_positions[token_id]
-                save_active_positions()
-
-        else:
-
-            print(
-                f"⚠️ Partial exit. "
-                f"{remaining_balance} remaining."
-            )
-
-            pos["size"] = remaining_balance
-            pos["status"] = "OPEN"
-
-            save_active_positions()
-
-    except Exception as e:
-
-        print(f"❌ Stop loss execution failed: {e}")
-
-        pos["status"] = "OPEN"
-        save_active_positions()
 
 async def send_heartbeat(websocket):
     while True:
@@ -474,8 +327,6 @@ async def monitor_global_bets():
 
     async with websockets.connect(WSS_URL) as websocket, httpx.AsyncClient() as client:
         asyncio.create_task(send_heartbeat(websocket))
-        if ENABLE_STOP_LOSS:
-            asyncio.create_task(monitor_stop_losses())
 
         subscribe_msg = {
             "action": "subscribe",
@@ -544,11 +395,6 @@ async def monitor_global_bets():
                 print(f"📈 Market: {p.get('title', market_slug)}")
                 print(f"⚡ Action: {side} {outcome} @ ${price} (Size: {size})")
 
-                # 5. Resolve Token ID and execute
-                #if not token_id:
-                #    token_id = await get_token_id_from_gamma(client, event_slug, market_slug, outcome)
-                
-                #if token_id:
                 asyncio.create_task(execute_trade(token_id, side, price, size))
                     
             except json.JSONDecodeError:
@@ -556,7 +402,6 @@ async def monitor_global_bets():
             except Exception as e:
                 print(f"⚠️ Connection Lost: {e}")
                 continue
-                #break
 
 if __name__ == "__main__":
     # Initialize the local data cache before runtime thread initialization

