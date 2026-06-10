@@ -26,11 +26,47 @@ telegram_bot = Bot(token=os.getenv("BOT_TOKEN"))
 # ==========================================
 
 # 1. Target Wallets & Categories Mapping
-TARGET_WALLETS_CONFIG = {
+# Custom wallets config
+"""TARGET_WALLETS_CONFIG = {
     "0x36901eb0f21519cc9055662a6d2483e96da1e16f": ["Sports", "Crypto", "Politics"],
     "0x81f80ba4769f17d270f0585ea546f2ed942e8ba9": ["Weather"],
     "0xba016b05c84c9f073e5c9059d247d37cea4b8535": ["Crypto"],
-}
+}"""
+
+# Leaderboard wallets config
+def generate_wallet_config(categories):
+    target_wallets_config = {}
+
+    print(f"Generating config dictionary for categories: {categories}\n")
+
+    for category in categories:
+        # Standardize the label case (e.g., 'crypto' -> 'Crypto')
+        label = category.capitalize()
+        json_source = f"{category}_wallets.json"
+
+        try:
+            with open(json_source, "r") as f:
+                wallets = json.load(f)
+
+            for wallet in wallets:
+                # Lowercase the address to ensure standard consistency
+                wallet_clean = wallet.lower()
+
+                # If the wallet somehow exists in an already loaded category, append the new label
+                if wallet_clean in target_wallets_config:
+                    if label not in target_wallets_config[wallet_clean]:
+                        target_wallets_config[wallet_clean].append(label)
+                else:
+                    target_wallets_config[wallet_clean] = [label]
+
+        except FileNotFoundError:
+            print(
+                f"Warning: Local data file '{json_source}' not found. Skipping {label}..."
+            )
+
+    return target_wallets_config
+
+TARGET_WALLETS_CONFIG = generate_wallet_config(["CRYPTO", "WEATHER", "SPORTS"])
 
 # Normalize configuration to lowercase for robust matching
 TARGET_WALLETS = {k.lower(): [tag.lower() for tag in v] for k, v in TARGET_WALLETS_CONFIG.items()}
@@ -128,6 +164,7 @@ def load_active_positions():
             }
 
             active_positions[asset] = position_data
+
             save_active_positions()
 
     except requests.exceptions.RequestException as e:
@@ -337,7 +374,7 @@ async def monitor_global_bets():
 
         await telegram_bot.send_message(
             chat_id=os.getenv("MY_CHAT_ID"), 
-            text=f"🚀 Copy trading initiated for following wallets: {TARGET_WALLETS}"
+            text=f"🚀 Copy trading initiated for configurated wallets!"
         )
 
         while True:

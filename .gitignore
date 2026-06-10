@@ -5,3 +5,6 @@ __pycache__
 reference
 _func.py
 active_positions.json
+CRYPTO_wallets.json
+SPORTS_wallets.json
+WEATHER_wallets.json

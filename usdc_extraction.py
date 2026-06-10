@@ -5,8 +5,6 @@ import os
 import time
 from dotenv import load_dotenv
 from web3 import Web3
-from py_builder_relayer_client.models import DepositWalletCall
-
 from py_builder_relayer_client.client import RelayClient
 from py_builder_relayer_client.models import DepositWalletCall, TransactionType
 from py_builder_signing_sdk.config import BuilderApiKeyCreds, BuilderConfig
