@@ -73,7 +73,7 @@ TARGET_WALLETS = {k.lower(): [tag.lower() for tag in v] for k, v in TARGET_WALLE
 
 # 2. Trade Sizing ("FIXED" or "PERCENTAGE")
 TRADE_MODE = "FIXED" 
-FIXED_AMOUNT = 5.0   # Buy exactly $5 pUSD per trade
+FIXED_AMOUNT = 4.0   # Buy exactly 4 USD per trade
 PERCENTAGE = 15.0    # If mode is PERCENTAGE, buy 15% of the leader's trade size
 
 # 3. Maximum Copy $ Amount (Hard cap per trade in pUSD)
@@ -87,14 +87,11 @@ PRICE_MAX = 0.96
 SLIPPAGE_TOLERANCE = 0.01
 
 # 6. Automatic Take Profit & Stop Loss
-ENABLE_TAKE_PROFIT = True
-ENABLE_STOP_LOSS = True
+ENABLE_TAKE_PROFIT = False
+ENABLE_STOP_LOSS = False
 
 TP_PERCENTAGE = 0.90     # 20% gain
 SL_PERCENTAGE = 0.50     # 10% loss
-
-SL_CHECK_INTERVAL = 3    # seconds
-SLIPPAGE_EXIT_BUFFER = 0.02  # extra aggressiveness on exits
 
 PAPER_TRADE = True
 
@@ -109,7 +106,6 @@ CLOB_HOST = "https://clob.polymarket.com"
 DB_FILE = "active_positions.json"  # Persistent local state database
 
 event_cache = {}       # Caches event_slug -> list of lowercased tags
-#market_cache = {}      # Caches market_slug -> {outcome: token_id}
 active_positions = {}  # Tracks SL per token: token_id -> {"size": size, "sl_price": price}
 
 def load_active_positions():
@@ -146,7 +142,7 @@ def load_active_positions():
             #outcome = pos.get("outcome", "N/A")
             size = pos.get("size", 0)
             avg_price = pos.get("avgPrice", 0)
-            #cur_price = pos.get("curPrice", 0)
+            cur_price = pos.get("curPrice", 0)
             #current_value = pos.get("currentValue", 0)
             #pnl = pos.get("cashPnl", 0)
             #pnl_percent = pos.get("percentPnl", 0)
@@ -156,6 +152,7 @@ def load_active_positions():
             sl_price = max(0.01, round(avg_price * (1 - SL_PERCENTAGE), 2))
 
             position_data = {
+                "cur_price": cur_price,
                 "size": size,
                 "entry_price": avg_price,
                 "total": size * avg_price,
@@ -164,8 +161,19 @@ def load_active_positions():
             }
 
             active_positions[asset] = position_data
-
-            save_active_positions()
+        
+        # --- FIXED CLEANUP LOOP ---
+        # 1. Use list(active_positions.items()) so we don't modify the dict while iterating over it.
+        # 2. Extract asset (key) and data (the actual dictionary containing the prices).
+        for asset, data in list(active_positions.items()):
+            cur_price = data.get("cur_price", 0)
+            entry = data.get("entry_price", 0)
+            
+            # If both current price and entry price are 0 or less, remove the asset tracker
+            if cur_price <= 0:
+                active_positions.pop(asset)
+        
+        save_active_positions()
 
     except requests.exceptions.RequestException as e:
         print(f"Error fetching positions: {e}")
@@ -279,13 +287,12 @@ async def execute_trade(token_id, leader_side, leader_price, leader_size):
                 sl_price = max(0.01, round(my_price * (1 - SL_PERCENTAGE), 2))
 
                 active_positions[token_id] = {
+                    "cur_price": leader_price,
                     "size": trade_size_shares,
                     "entry_price": my_price,
                     "total": trade_size_shares * my_price,
                     "tp_price": tp_price,
                     "sl_price": sl_price,
-                    "status": "OPEN",           # Required for your SL monitor!
-                    "sl_enabled": ENABLE_STOP_LOSS # Required for your SL monitor!
                 }
             else:
                 old_size = active_positions[token_id]["size"]
@@ -294,12 +301,12 @@ async def execute_trade(token_id, leader_side, leader_price, leader_size):
                 new_size = old_size + trade_size_shares
                 new_entry_price = ((old_size * old_entry) + (trade_size_shares * my_price)) / new_size
 
+                active_positions[token_id]["cur_price"] = leader_price
                 active_positions[token_id]["size"] = new_size
                 active_positions[token_id]["entry_price"] = round(new_entry_price, 4)
                 active_positions[token_id]["total"] = new_size * new_entry_price
                 active_positions[token_id]["tp_price"] = min(0.99, round(new_entry_price * (1 + TP_PERCENTAGE), 2))
                 active_positions[token_id]["sl_price"] = max(0.01, round(new_entry_price * (1 - SL_PERCENTAGE), 2))
-                active_positions[token_id]["status"] = "OPEN" # Ensure state is explicitly set to open
 
             save_active_positions()
             
