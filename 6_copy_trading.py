@@ -108,7 +108,7 @@ DB_FILE = "active_positions.json"  # Persistent local state database
 event_cache = {}       # Caches event_slug -> list of lowercased tags
 active_positions = {}  # Tracks SL per token: token_id -> {"size": size, "sl_price": price}
 
-def load_active_positions():
+async def load_active_positions():
     """Loads active tracking positions from the local JSON database file upon startup."""
     global active_positions
     if os.path.exists(DB_FILE):
@@ -119,64 +119,65 @@ def load_active_positions():
         except Exception as e:
             print(f"⚠️ Database Error: Failed to parse storage file, starting clean: {e}")
     
-    # Query parameters based on the API specification
-    params = {
-        "user": os.getenv("DEPOSIT_WALLET"),
-        "sizeThreshold": 1,       # Only show positions with a meaningful size
-        "limit": 500,             # Number of positions to return per request (max 500)
-        "sortBy": "TOKENS",
-        "sortDirection": "DESC"
-    }
-    
-    try:
-        response = requests.get(POSITIONS_URL, params=params)
-        response.raise_for_status()
-        positions = response.json()
-        
-        if not positions:
-            print(f"No current active positions found for wallet: {os.getenv('DEPOSIT_WALLET')}")
-            return
-        
-        for pos in positions:
-            #title = pos.get("title", "Unknown Market")
-            #outcome = pos.get("outcome", "N/A")
-            size = pos.get("size", 0)
-            avg_price = pos.get("avgPrice", 0)
-            cur_price = pos.get("curPrice", 0)
-            #current_value = pos.get("currentValue", 0)
-            #pnl = pos.get("cashPnl", 0)
-            #pnl_percent = pos.get("percentPnl", 0)
-            asset = pos.get("asset")
-
-            tp_price = min(0.99, round(avg_price * (1 + TP_PERCENTAGE), 2))
-            sl_price = max(0.01, round(avg_price * (1 - SL_PERCENTAGE), 2))
-
-            position_data = {
-                "cur_price": cur_price,
-                "size": size,
-                "entry_price": avg_price,
-                "total": size * avg_price,
-                "tp_price": tp_price,
-                "sl_price": sl_price,
+    async with httpx.AsyncClient() as client:
+        while True:
+            # Query parameters based on the API specification
+            params = {
+                "user": os.getenv("DEPOSIT_WALLET"),
+                "sizeThreshold": 1,       # Only show positions with a meaningful size
+                "limit": 500,             # Number of positions to return per request (max 500)
+                "sortBy": "TOKENS",
+                "sortDirection": "DESC"
             }
-
-            active_positions[asset] = position_data
-        
-        # --- FIXED CLEANUP LOOP ---
-        # 1. Use list(active_positions.items()) so we don't modify the dict while iterating over it.
-        # 2. Extract asset (key) and data (the actual dictionary containing the prices).
-        for asset, data in list(active_positions.items()):
-            cur_price = data.get("cur_price", 0)
-            entry = data.get("entry_price", 0)
             
-            # If both current price and entry price are 0 or less, remove the asset tracker
-            if cur_price <= 0:
-                active_positions.pop(asset)
-        
-        save_active_positions()
+            try:
+                response = await client.get(POSITIONS_URL, params=params)
+                response.raise_for_status()
+                positions = response.json()
+                
+                if not positions:
+                    print(f"No current active positions found for wallet: {os.getenv('DEPOSIT_WALLET')}")
+                    continue
+                
+                for pos in positions:
+                    #title = pos.get("title", "Unknown Market")
+                    #outcome = pos.get("outcome", "N/A")
+                    size = pos.get("size", 0)
+                    avg_price = pos.get("avgPrice", 0)
+                    cur_price = pos.get("curPrice", 0)
+                    #current_value = pos.get("currentValue", 0)
+                    #pnl = pos.get("cashPnl", 0)
+                    #pnl_percent = pos.get("percentPnl", 0)
+                    asset = pos.get("asset")
 
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching positions: {e}")
+                    tp_price = min(0.99, round(avg_price * (1 + TP_PERCENTAGE), 2))
+                    sl_price = max(0.01, round(avg_price * (1 - SL_PERCENTAGE), 2))
+
+                    position_data = {
+                        "cur_price": cur_price,
+                        "size": size,
+                        "entry_price": avg_price,
+                        "total": size * avg_price,
+                        "tp_price": tp_price,
+                        "sl_price": sl_price,
+                    }
+
+                    active_positions[asset] = position_data
+                
+                for asset, data in list(active_positions.items()):
+                    cur_price = data.get("cur_price", 0)
+                    
+                    # If both current price and entry price are 0 or less, remove the asset tracker
+                    if cur_price <= 0 or size <= 0:
+                        active_positions.pop(asset, None)
+                
+                save_active_positions()
+
+            except requests.exceptions.RequestException as e:
+                print(f"Error fetching positions: {e}")
+            
+            await asyncio.sleep(15)
+        
 
 def save_active_positions():
     """Commits current tracking configuration safely to disk."""
@@ -447,10 +448,15 @@ async def monitor_global_bets():
                 print(f"⚠️ Connection Lost: {e}")
                 continue
 
+async def main():
+    # Run both your websocket listener and background tracker concurrently!
+    await asyncio.gather(
+        monitor_global_bets(),
+        load_active_positions()
+    )
+
 if __name__ == "__main__":
-    # Initialize the local data cache before runtime thread initialization
-    load_active_positions()
     try:
-        asyncio.run(monitor_global_bets())
+        asyncio.run(main())
     except KeyboardInterrupt:
         print("\n🛑 Stopped by user.")
