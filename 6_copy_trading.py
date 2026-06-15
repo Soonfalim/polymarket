@@ -87,8 +87,8 @@ PRICE_MAX = 0.96
 SLIPPAGE_TOLERANCE = 0.01
 
 # 6. Automatic Take Profit & Stop Loss
-ENABLE_TAKE_PROFIT = False
-ENABLE_STOP_LOSS = False
+ENABLE_TAKE_PROFIT = True
+ENABLE_STOP_LOSS = True
 
 TP_PERCENTAGE = 0.90     # 20% gain
 SL_PERCENTAGE = 0.50     # 10% loss
@@ -108,7 +108,7 @@ DB_FILE = "active_positions.json"  # Persistent local state database
 event_cache = {}       # Caches event_slug -> list of lowercased tags
 active_positions = {}  # Tracks SL per token: token_id -> {"size": size, "sl_price": price}
 
-def load_active_positions():
+async def load_active_positions():
     """Loads active tracking positions from the local JSON database file upon startup."""
     global active_positions
     if os.path.exists(DB_FILE):
@@ -119,64 +119,84 @@ def load_active_positions():
         except Exception as e:
             print(f"⚠️ Database Error: Failed to parse storage file, starting clean: {e}")
     
-    # Query parameters based on the API specification
-    params = {
-        "user": os.getenv("DEPOSIT_WALLET"),
-        "sizeThreshold": 1,       # Only show positions with a meaningful size
-        "limit": 500,             # Number of positions to return per request (max 500)
-        "sortBy": "TOKENS",
-        "sortDirection": "DESC"
-    }
-    
-    try:
-        response = requests.get(POSITIONS_URL, params=params)
-        response.raise_for_status()
-        positions = response.json()
-        
-        if not positions:
-            print(f"No current active positions found for wallet: {os.getenv('DEPOSIT_WALLET')}")
-            return
-        
-        for pos in positions:
-            #title = pos.get("title", "Unknown Market")
-            #outcome = pos.get("outcome", "N/A")
-            size = pos.get("size", 0)
-            avg_price = pos.get("avgPrice", 0)
-            cur_price = pos.get("curPrice", 0)
-            #current_value = pos.get("currentValue", 0)
-            #pnl = pos.get("cashPnl", 0)
-            #pnl_percent = pos.get("percentPnl", 0)
-            asset = pos.get("asset")
+    update_positions()
 
-            tp_price = min(0.99, round(avg_price * (1 + TP_PERCENTAGE), 2))
-            sl_price = max(0.01, round(avg_price * (1 - SL_PERCENTAGE), 2))
 
-            position_data = {
-                "cur_price": cur_price,
-                "size": size,
-                "entry_price": avg_price,
-                "total": size * avg_price,
-                "tp_price": tp_price,
-                "sl_price": sl_price,
+async def update_positions():
+    async with httpx.AsyncClient() as client:
+        while True:
+            params = {
+                "user": os.getenv("DEPOSIT_WALLET"),
+                "sizeThreshold": 0.1,  # Lowered slightly to catch smaller fractional shares
+                "limit": 500,
+                "sortBy": "TOKENS",
+                "sortDirection": "DESC"
             }
-
-            active_positions[asset] = position_data
-        
-        # --- FIXED CLEANUP LOOP ---
-        # 1. Use list(active_positions.items()) so we don't modify the dict while iterating over it.
-        # 2. Extract asset (key) and data (the actual dictionary containing the prices).
-        for asset, data in list(active_positions.items()):
-            cur_price = data.get("cur_price", 0)
-            entry = data.get("entry_price", 0)
             
-            # If both current price and entry price are 0 or less, remove the asset tracker
-            if cur_price <= 0:
-                active_positions.pop(asset)
-        
-        save_active_positions()
+            try:
+                response = await client.get(POSITIONS_URL, params=params)
+                response.raise_for_status()
+                positions = response.json()
+                
+                if not positions:
+                    print(f"No current active positions found for wallet: {os.getenv('DEPOSIT_WALLET')}")
+                    await asyncio.sleep(15)
+                    continue
+                
+                for pos in positions:
+                    size = float(pos.get("size", 0))
+                    avg_price = float(pos.get("avgPrice", 0))
+                    cur_price = float(pos.get("curPrice", 0))
+                    asset = pos.get("asset")
 
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching positions: {e}")
+                    if size <= 0 or avg_price <= 0:
+                        continue
+
+                    tp_price = min(0.99, round(avg_price * (1 + TP_PERCENTAGE), 2))
+                    sl_price = max(0.01, round(avg_price * (1 - SL_PERCENTAGE), 2))
+
+                    # ==========================================
+                    # ACTIVE STOP-LOSS MONITORING LOGIC
+                    # ==========================================
+                    price_drop_pct = ((avg_price - cur_price) / avg_price) * 100 if avg_price > 0 else 0
+
+                    if price_drop_pct >= (SL_PERCENTAGE * 100):
+                        status_indicator = "🛑 STOP-LOSS HIT!"
+                    elif price_drop_pct > 0:
+                        status_indicator = "📉 IN LOSS"
+                    else:
+                        status_indicator = "📈 IN PROFIT"
+
+                    print(f"[{status_indicator}] Token: {asset[:8]}... | "
+                          f"Entry: {avg_price:.4f} | "
+                          f"Now: {cur_price:.4f} | "
+                          f"P/L: {-price_drop_pct:.2f}%")
+
+                    active_positions[asset] = {
+                        "cur_price": cur_price,
+                        "size": size,
+                        "entry_price": avg_price,
+                        "total": size * avg_price,
+                        "tp_price": tp_price,
+                        "sl_price": sl_price,
+                    }
+
+                    # Trigger execution if Stop Loss is active and threshold is breached
+                    if ENABLE_STOP_LOSS and price_drop_pct >= (SL_PERCENTAGE * 100):
+                        await execute_stop_loss(asset, size, cur_price)
+                
+                # Cleanup closed/empty positions
+                for asset, data in list(active_positions.items()):
+                    if float(data.get("size", 0)) <= 0:
+                        active_positions.pop(asset, None)
+                
+                save_active_positions()
+
+            except requests.exceptions.RequestException as e:
+                print(f"⚠️ Error fetching positions: {e}")
+            
+            await asyncio.sleep(15)
+        
 
 def save_active_positions():
     """Commits current tracking configuration safely to disk."""
@@ -206,10 +226,10 @@ except Exception as e:
     print(f"⚠️ Failed to init CLOB Client. Check your .env keys: {e}")
     poly_client = None
 
+
 # ==========================================
 # CORE FUNCTIONS
 # ==========================================
-
 async def fetch_and_cache_gamma_data(client, event_slug):
     """Single API call to fetch tags and token mappings for an event slug."""
     if event_slug in event_cache:
@@ -229,6 +249,7 @@ async def fetch_and_cache_gamma_data(client, event_slug):
     except Exception as e:
         print(f"⚠️ API Error fetching data for slug {event_slug}: {e}")
     return []
+
 
 async def execute_trade(token_id, leader_side, leader_price, leader_size):
     if not poly_client:
@@ -250,11 +271,6 @@ async def execute_trade(token_id, leader_side, leader_price, leader_size):
         return
 
     print(f"🤖 EXECUTING: {my_side.name} {trade_size_shares} shares @ ${my_price}")
-
-    await telegram_bot.send_message(
-            chat_id=os.getenv("MY_CHAT_ID"), 
-            text=f"Attempting to trade {my_side.name} {trade_size_shares} @ ${my_price}"
-        )
     
     current_total = active_positions.get(token_id, {}).get("total", 0.0)
 
@@ -279,7 +295,7 @@ async def execute_trade(token_id, leader_side, leader_price, leader_size):
             
             await telegram_bot.send_message(
                 chat_id=os.getenv("MY_CHAT_ID"), 
-                text=f"Successful"
+                text=f"Traded {my_side.name} {trade_size_shares} @ ${my_price}"
             )
 
             if token_id not in active_positions:
@@ -320,6 +336,7 @@ async def execute_trade(token_id, leader_side, leader_price, leader_size):
     else:
         print("Cancelling trade order, limit for market reached!")
 
+
 async def setup_tp(token_id, tp_price, size):
     # ==========================================
     # TAKE PROFIT
@@ -345,11 +362,53 @@ async def setup_tp(token_id, tp_price, size):
     else:
         print(f"✅ TP order placed at {tp_price}")
 
+
+async def execute_stop_loss(token_id, size, current_price):
+    """Closes the position by selling shares when stop-loss threshold is hit."""
+    if not poly_client:
+        return
+
+    print("=" * 60)
+    print(f"🚨 EXECUTING STOP LOSS: Selling {size:.2f} shares of {token_id}")
+    print("=" * 60)
+
+    if not PAPER_TRADE:
+        try:
+            # Price slightly below current to ensure Fill-Or-Kill execution acts like a market sell
+            sell_price = max(0.01, round(current_price * (1 - SLIPPAGE_TOLERANCE), 2))
+
+            resp = await asyncio.to_thread(
+                poly_client.create_and_post_order,
+                OrderArgs(
+                    price=sell_price,
+                    size=size,
+                    side=Side.SELL,
+                    token_id=token_id
+                ),
+                options=PartialCreateOrderOptions(tick_size="0.01"),
+                order_type=OrderType.FOK 
+            )
+
+            print(f"✅ SL Trade Response: {resp.get('success', False)} | Error: {resp.get('errorID', 'None')}")
+            
+            if resp.get('success'):
+                await telegram_bot.send_message(
+                    chat_id=os.getenv("MY_CHAT_ID"), 
+                    text=f"🚨 <b>STOP-LOSS TRIGGERED</b>\n\nToken: <code>{token_id}</code>\nSold {size:.2f} shares @ ~${sell_price:.2f}",
+                    parse_mode="HTML"
+                )
+                
+        except Exception as e:
+            print(f"❌ Stop Loss Execution Failed: {e}")
+    else:
+        print(f"✅ [PAPER TRADE] Stop Loss successfully executed for {token_id}!")
+
+
 async def setup_sl(token_id, sl_price, size):
     # ==========================================
     # STOP LOSS REGISTRATION
     # ==========================================
-    print(f"🛡️ Stop loss armed")
+    print(f"🛡️ Stop loss armed for {token_id[:8]}... (Monitoring loop active)")
 
 
 async def send_heartbeat(websocket):
@@ -363,7 +422,6 @@ async def send_heartbeat(websocket):
 # ==========================================
 # WEBSOCKET LISTENER LOOP
 # ==========================================
-
 async def monitor_global_bets():
     if not TARGET_WALLETS:
         print("⚠️ No TARGET_WALLETS configured!")
@@ -447,10 +505,17 @@ async def monitor_global_bets():
                 print(f"⚠️ Connection Lost: {e}")
                 continue
 
+
+async def main():
+    # Run both your websocket listener and background tracker concurrently!
+    await asyncio.gather(
+        monitor_global_bets(),
+        load_active_positions()
+    )
+
+
 if __name__ == "__main__":
-    # Initialize the local data cache before runtime thread initialization
-    load_active_positions()
     try:
-        asyncio.run(monitor_global_bets())
+        asyncio.run(main())
     except KeyboardInterrupt:
         print("\n🛑 Stopped by user.")
