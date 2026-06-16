@@ -72,7 +72,7 @@ PRICE_MAX = 0.95
 
 SLIPPAGE_TOLERANCE = 0.01
 
-ENABLE_TAKE_PROFIT = True
+ENABLE_TAKE_PROFIT = False
 ENABLE_STOP_LOSS = True
 
 TP_PERCENTAGE = 0.90
@@ -434,84 +434,94 @@ async def monitor_global_bets():
         print("⚠️ No TARGET_WALLETS configured!")
         return
 
-    async with websockets.connect(WSS_URL) as websocket, httpx.AsyncClient() as client:
-        asyncio.create_task(send_heartbeat(websocket))
-
-        subscribe_msg = {
-            "action": "subscribe",
-            "subscriptions": [{"topic": "activity", "type": "trades"}]
-        }
-        await websocket.send(json.dumps(subscribe_msg))
-        print(f"🚀 Connected! Monitoring customized specialized wallets. (DB active updates armed)")
-
-        await telegram_bot.send_message(
-            chat_id=os.getenv("MY_CHAT_ID"), 
-            text=f"🚀 Copy trading initiated for configurated wallets!"
-        )
-
+    # Instantiate HTTP client outside the connection loop to reuse connections
+    async with httpx.AsyncClient() as client:
         while True:
+            print(f"🔄 Connecting to Polymarket WebSocket: {WSS_URL}...")
+            heartbeat_task = None
             try:
-                message = await websocket.recv()
-                if not message.strip().startswith('{'):
-                    continue
-                
-                data = json.loads(message)
-                p = data.get("payload", {})
-                if not p:
-                    continue
-
-                wallet = p.get("proxyWallet", "Unknown").lower()
-                pseudonym = p.get("pseudonym", "").lower()
-                event_slug = p.get("eventSlug")
-                market_slug = p.get("slug")
-                outcome = p.get("outcome")
-                price = float(p.get("price", 0))
-                size = float(p.get("size", 0))
-                side = p.get("side", "").upper()
-                token_id = p.get("asset")
-
-                combined_slug_string = f"{event_slug or ''} {market_slug or ''}".lower()
-                if any(blacklisted in combined_slug_string for blacklisted in EXCLUDED_SLUGS):
-                    continue
-
-                assigned_categories = None
-                matched_identity = None
-
-                if wallet in TARGET_WALLETS:
-                    assigned_categories = TARGET_WALLETS[wallet]
-                    matched_identity = wallet
-                elif pseudonym in TARGET_WALLETS:
-                    assigned_categories = TARGET_WALLETS[pseudonym]
-                    matched_identity = pseudonym
-
-                if assigned_categories is None:
-                    continue
-
-                if not event_slug:
-                    continue
-                
-                event_tags = await fetch_and_cache_gamma_data(client, event_slug)
-                has_matching_category = any(tag in assigned_categories for tag in event_tags)
-                if not has_matching_category:
-                    continue
-
-                if PRICE_MIN is not None and price < PRICE_MIN:
-                    continue
-                if PRICE_MAX is not None and price > PRICE_MAX:
-                    continue
-
-                print("-" * 50)
-                print(f"🎯 TARGET TRADE DETECTED: {matched_identity}")
-                print(f"📈 Market: {p.get('title', market_slug)}")
-                print(f"⚡ Action: {side} {outcome} @ ${price} (Size: {size})")
-
-                asyncio.create_task(execute_trade(token_id, side, price, size))
+                async with websockets.connect(WSS_URL) as websocket:
+                    print("🚀 Connected! Registering subscriptions...")
                     
+                    # Start the heartbeat task bound to this specific websocket connection
+                    heartbeat_task = asyncio.create_task(send_heartbeat(websocket))
+
+                    subscribe_msg = {
+                        "action": "subscribe",
+                        "subscriptions": [{"topic": "activity", "type": "trades"}]
+                    }
+                    await websocket.send(json.dumps(subscribe_msg))
+                    print("🎯 Monitoring customized specialized wallets. (DB active updates armed)")
+
+                    while True:
+                        message = await websocket.recv()
+                        if not message.strip().startswith('{'):
+                            continue
+                        
+                        data = json.loads(message)
+                        p = data.get("payload", {})
+                        if not p:
+                            continue
+
+                        wallet = p.get("proxyWallet", "Unknown").lower()
+                        pseudonym = p.get("pseudonym", "").lower()
+                        event_slug = p.get("eventSlug")
+                        market_slug = p.get("slug")
+                        outcome = p.get("outcome")
+                        price = float(p.get("price", 0))
+                        size = float(p.get("size", 0))
+                        side = p.get("side", "").upper()
+                        token_id = p.get("asset")
+
+                        combined_slug_string = f"{event_slug or ''} {market_slug or ''}".lower()
+                        if any(blacklisted in combined_slug_string for blacklisted in EXCLUDED_SLUGS):
+                            continue
+
+                        assigned_categories = None
+                        matched_identity = None
+
+                        if wallet in TARGET_WALLETS:
+                            assigned_categories = TARGET_WALLETS[wallet]
+                            matched_identity = wallet
+                        elif pseudonym in TARGET_WALLETS:
+                            assigned_categories = TARGET_WALLETS[pseudonym]
+                            matched_identity = pseudonym
+
+                        if assigned_categories is None:
+                            continue
+
+                        if not event_slug:
+                            continue
+                        
+                        event_tags = await fetch_and_cache_gamma_data(client, event_slug)
+                        has_matching_category = any(tag in assigned_categories for tag in event_tags)
+                        if not has_matching_category:
+                            continue
+
+                        if PRICE_MIN is not None and price < PRICE_MIN:
+                            continue
+                        if PRICE_MAX is not None and price > PRICE_MAX:
+                            continue
+
+                        print("-" * 50)
+                        print(f"🎯 TARGET TRADE DETECTED: {matched_identity}")
+                        print(f"📈 Market: {p.get('title', market_slug)}")
+                        print(f"⚡ Action: {side} {outcome} @ ${price} (Size: {size})")
+
+                        asyncio.create_task(execute_trade(token_id, side, price, size))
+                            
             except json.JSONDecodeError:
                 continue
+            except websockets.exceptions.ConnectionClosed as e:
+                print(f"⚠️ WebSocket Disconnected (Code {e.code}): {e.reason}. Reconnecting in 5s...")
             except Exception as e:
-                print(f"⚠️ Connection Lost: {e}")
-                continue
+                print(f"⚠️ Network error encountered: {e}. Reconnecting in 5s...")
+            finally:
+                # Cancel the current heartbeat task when the connection drops so they don't stack up
+                if heartbeat_task and not heartbeat_task.done():
+                    heartbeat_task.cancel()
+                
+                await asyncio.sleep(5)
 
 
 async def main():
