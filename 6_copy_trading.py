@@ -56,15 +56,15 @@ def generate_wallet_config(categories):
 
     return target_wallets_config
 
-TARGET_WALLETS_CONFIG = generate_wallet_config(["CRYPTO", "WEATHER", "SPORTS"])
+TARGET_WALLETS_CONFIG = generate_wallet_config(["CRYPTO", "WEATHER"])
 
 TARGET_WALLETS = {k.lower(): [tag.lower() for tag in v] for k, v in TARGET_WALLETS_CONFIG.items()}
 
 TRADE_MODE = "FIXED" 
-FIXED_AMOUNT = 100.0   
-PERCENTAGE = 15.0    
+FIXED_AMOUNT = 2.0
+PERCENTAGE = 15.0
 
-MAX_COPY_AMOUNT = 13.0
+MAX_COPY_AMOUNT = 8.0
 
 PRICE_MIN = 0.50
 PRICE_MAX = 0.95
@@ -174,8 +174,10 @@ async def update_positions():
                 
                 save_active_positions()
 
-            except requests.exceptions.RequestException as e:
-                print(f"⚠️ Error fetching positions: {e}")
+            except httpx.HTTPError as e:
+                print(f"⚠️ Network error fetching positions: {e}")
+            except Exception as e:
+                print(f"⚠️ Unexpected error in update_positions: {e}")
             
             await asyncio.sleep(15)
         
@@ -422,8 +424,8 @@ async def setup_sl(token_id, sl_price, size):
 async def send_heartbeat(websocket):
     while True:
         try:
-            await websocket.send("ping")
-            await asyncio.sleep(10)
+            await websocket.send("PING")
+            await asyncio.sleep(5)
         except:
             break
 
@@ -441,7 +443,7 @@ async def monitor_global_bets():
             "subscriptions": [{"topic": "activity", "type": "trades"}]
         }
         await websocket.send(json.dumps(subscribe_msg))
-        print(f"🚀 Connected! Monitoring customized specialized wallets. (DB active updates armed)")
+        print(f"🚀 Connected! Monitoring customized specialized wallets.")
 
         await telegram_bot.send_message(
             chat_id=os.getenv("MY_CHAT_ID"), 
@@ -451,10 +453,9 @@ async def monitor_global_bets():
         while True:
             try:
                 message = await websocket.recv()
-                if not message.strip().startswith('{'):
-                    continue
                 
                 data = json.loads(message)
+
                 p = data.get("payload", {})
                 if not p:
                     continue
@@ -468,6 +469,10 @@ async def monitor_global_bets():
                 size = float(p.get("size", 0))
                 side = p.get("side", "").upper()
                 token_id = p.get("asset")
+
+                combined_slug_string = f"{event_slug or ''} {market_slug or ''}".lower()
+                if any(blacklisted in combined_slug_string for blacklisted in EXCLUDED_SLUGS):
+                    continue
 
                 # 2. Target Wallet Filter Verification
                 assigned_categories = None
