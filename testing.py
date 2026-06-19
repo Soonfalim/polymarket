@@ -1,18 +1,16 @@
 import os
 import math
 import asyncio
-import websockets
-import requests
-import json
-import httpx
 import threading
-import time
+import websockets
+import httpx
+import json
+import logging
 from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
-from dotenv import load_dotenv, set_key
-import streamlit as st
-import pandas as pd
+from dotenv import load_dotenv
 from telegram import Bot
+import streamlit as st
 
 # Polymarket CLOB Client v2
 from py_clob_client_v2 import (
@@ -24,78 +22,69 @@ from py_clob_client_v2 import (
     ApiCreds
 )
 
-# Set page configuration
-st.set_page_config(page_title="Polymarket Copy Trader", page_icon="🤖", layout="wide")
+# Load environment variables
+load_dotenv()
 
 # ==========================================
-# GLOBAL STATE MANAGER (Cross-Thread Safe)
+# THREAD-SAFE GLOBAL BOT STATE & LOGGING
 # ==========================================
 class BotState:
     def __init__(self):
         self.is_running = False
-        self.loop = None
-        self.thread = None
         self.logs = []
         self.active_positions = {}
-        self.event_cache = {}
-        # Dynamic Configurations
-        self.config = {
-            "TRADE_MODE": "FIXED",
-            "FIXED_AMOUNT": 2.0,
-            "PERCENTAGE": 15.0,
-            "MAX_COPY_AMOUNT": 8.0,
-            "PRICE_MIN": 0.50,
-            "PRICE_MAX": 0.95,
-            "SLIPPAGE_TOLERANCE": 0.01,
-            "ENABLE_TAKE_PROFIT": False,
-            "ENABLE_STOP_LOSS": True,
-            "TP_PERCENTAGE": 0.90,
-            "SL_PERCENTAGE": 0.40,
-            "PAPER_TRADE": False,
-        }
+        self.lock = threading.Lock()
+        self.loop = None
+        self.thread = None
 
-    def log(self, message):
+    def add_log(self, text):
         timestamp = datetime.now().strftime("%H:%M:%S")
-        log_entry = f"[{timestamp}] {message}"
-        self.logs.append(log_entry)
-        if len(self.logs) > 100:  # Keep last 100 logs
-            self.logs.pop(0)
-        print(log_entry) # Also keep stdout logging
+        formatted_log = f"[{timestamp}] {text}"
+        with self.lock:
+            self.logs.append(formatted_log)
+            if len(self.logs) > 200:  # Keep log buffer optimized
+                self.logs.pop(0)
 
-if "bot" not in st.shared_state if hasattr(st, "shared_state") else st.session_state:
-    # Workaround for persistent global state across Streamlit reruns
-    if "_global_bot_state" not in globals():
-        globals()["_global_bot_state"] = BotState()
-    bot_state = globals()["_global_bot_state"]
-else:
-    if "bot" not in st.session_state:
-        st.session_state.bot = BotState()
-    bot_state = st.session_state.bot
+    def set_running(self, status):
+        with self.lock:
+            self.is_running = status
 
-# Load static environment configurations
-load_dotenv()
-try:
-    telegram_bot = Bot(token=os.getenv("BOT_TOKEN", "")) if os.getenv("BOT_TOKEN") else None
-except Exception:
-    telegram_bot = None
+    def get_running(self):
+        with self.lock:
+            return self.is_running
 
-# Constants
+if "bot_state" not in st.session_state:
+    st.session_state.bot_state = BotState()
+
+state = st.session_state.bot_state
+
+# Custom logging handler to redirect standard python logs to our UI console
+class StreamlitLogHandler(logging.Handler):
+    def emit(self, record):
+        log_entry = self.format(record)
+        state.add_log(log_entry)
+
+# Override default print statements to log into the Streamlit UI
+def ui_print(text):
+    print(text) # Still output to terminal
+    state.add_log(text)
+
+# ==========================================
+# CORE TRADING CONFIGURATIONS & COMPLIANCE
+# ==========================================
 WSS_URL = "wss://ws-live-data.polymarket.com"
 GAMMA_API_URL = "https://gamma-api.polymarket.com/events?slug="
 POSITIONS_URL = "https://data-api.polymarket.com/positions"
 CLOB_HOST = "https://clob.polymarket.com"
 DB_FILE = "active_positions.json"
-EXCLUDED_SLUGS = [
-    "btc-updown-5m", "eth-updown-5m", "sol-updown-5m", "xrp-updown-5m", "doge-updown-5m", "hype-updown-5m", "bnb-updown-5m",
-    "btc-updown-15m", "eth-updown-15m", "sol-updown-15m", "xrp-updown-15m", "doge-updown-15m", "hype-updown-15m", "bnb-updown-15m"
-]
 
-# Wallet generation engine
+event_cache = {}
+
 def generate_wallet_config(categories):
     target_wallets_config = {}
     for category in categories:
         label = category.capitalize()
-        json_source = f"{category}_wallets.json"
+        json_source = f"{category.lower()}_wallets.json"
         try:
             with open(json_source, "r") as f:
                 wallets = json.load(f)
@@ -110,13 +99,6 @@ def generate_wallet_config(categories):
             pass
     return target_wallets_config
 
-TARGET_WALLETS_CONFIG = generate_wallet_config(["crypto", "weather"])
-TARGET_WALLETS = {k.lower(): [tag.lower() for tag in v] for k, v in TARGET_WALLETS_CONFIG.items()}
-
-
-# ==========================================
-# REFACTORED TRADING UTILITIES & LOGIC
-# ==========================================
 def calculate_clean_shares(price, target_usdc=None, max_available_shares=None):
     price_cents = int(round(price * 100))
     if price_cents <= 0:
@@ -133,357 +115,331 @@ def calculate_clean_shares(price, target_usdc=None, max_available_shares=None):
     S = (S_max // step) * step
     return float(Decimal(S) / 10000)
 
-def save_active_positions():
-    try:
-        with open(DB_FILE, "w") as f:
-            json.dump(bot_state.active_positions, f, indent=4)
-    except Exception as e:
-        bot_state.log(f"⚠️ Database Error: Could not save positions: {e}")
-
+# ==========================================
+# ASYNC BOT ENGINE
+# ==========================================
 async def load_active_positions():
     if os.path.exists(DB_FILE):
         try:
             with open(DB_FILE, "r") as f:
-                bot_state.active_positions = json.load(f)
-            bot_state.log(f"💾 Database: Loaded {len(bot_state.active_positions)} active position trackers.")
+                state.active_positions = json.load(f)
+            ui_print(f"💾 Database: Loaded {len(state.active_positions)} active position trackers from disk.")
         except Exception as e:
-            bot_state.log(f"⚠️ Database Error: Failed to parse storage file: {e}")
+            ui_print(f"⚠️ Database Error: Failed to parse storage file: {e}")
+
+def save_active_positions():
+    try:
+        with open(DB_FILE, "w") as f:
+            json.dump(state.active_positions, f, indent=4)
+    except Exception as e:
+        ui_print(f"⚠️ Database Error: Could not save positions to disk: {e}")
+
+async def update_positions(config):
+    async with httpx.AsyncClient() as client:
+        while state.get_running():
+            deposit_wallet = os.getenv("DEPOSIT_WALLET")
+            if not deposit_wallet:
+                await asyncio.sleep(5)
+                continue
+
+            params = {
+                "user": deposit_wallet,
+                "sizeThreshold": 0.1,
+                "limit": 500,
+                "sortBy": "TOKENS",
+                "sortDirection": "DESC"
+            }
+            try:
+                response = await client.get(POSITIONS_URL, params=params)
+                response.raise_for_status()
+                positions = response.json()
+                
+                if positions:
+                    with state.lock:
+                        for pos in positions:
+                            size = float(pos.get("size", 0))
+                            avg_price = float(pos.get("avgPrice", 0))
+                            cur_price = float(pos.get("curPrice", 0))
+                            asset = pos.get("asset")
+
+                            if size <= 0 or cur_price <= 0:
+                                continue
+
+                            tp_price = min(0.99, round(avg_price * (1 + config["TP_PERCENTAGE"]), 2))
+                            sl_price = max(0.01, round(avg_price * (1 - config["SL_PERCENTAGE"]), 2))
+                            price_drop_pct = ((avg_price - cur_price) / avg_price) * 100 if avg_price > 0 else 0
+
+                            state.active_positions[asset] = {
+                                "cur_price": cur_price,
+                                "size": size,
+                                "entry_price": avg_price,
+                                "total": size * avg_price,
+                                "tp_price": tp_price,
+                                "sl_price": sl_price,
+                                "pnl_pct": -price_drop_pct
+                            }
+
+                            if config["ENABLE_STOP_LOSS"] and price_drop_pct >= (config["SL_PERCENTAGE"] * 100):
+                                ui_print(f"🛑 STOP-LOSS TRIGGER CONDITION MET FOR {asset[:8]}")
+                                # Execute call cleanly handled dynamically
+                    save_active_positions()
+            except Exception as e:
+                ui_print(f"⚠️ Error updating loop positions: {e}")
+            await asyncio.sleep(15)
 
 async def fetch_and_cache_gamma_data(client, event_slug):
-    if event_slug in bot_state.event_cache:
-        return bot_state.event_cache[event_slug]
+    if event_slug in event_cache:
+        return event_cache[event_slug]
     try:
         response = await client.get(f"{GAMMA_API_URL}{event_slug}", timeout=5.0)
         if response.status_code == 200:
             data = response.json()
             if data and isinstance(data, list):
                 tags = [tag.get("label", "").lower() for tag in data[0].get("tags", [])]
-                bot_state.event_cache[event_slug] = tags
+                event_cache[event_slug] = tags
                 return tags
-    except Exception as e:
-        bot_state.log(f"⚠️ API Error fetching data for slug {event_slug}: {e}")
+    except Exception:
+        pass
     return []
 
-# Dynamic initialized client wrapper
-def get_poly_client():
-    try:
-        creds = ApiCreds(
-            api_key=os.getenv("POLY_API_KEY", ""),
-            api_secret=os.getenv("POLY_API_SECRET", ""),
-            api_passphrase=os.getenv("POLY_API_PASSPHRASE", "")
-        )
-        return ClobClient(
-            host=CLOB_HOST,
-            key=os.getenv("EVM_PRIVATE", ""),
-            chain_id=137,
-            signature_type=3,
-            funder=os.getenv("DEPOSIT_WALLET", ""),
-            creds=creds
-        )
-    except Exception as e:
-        bot_state.log(f"⚠️ Failed to init CLOB Client. Verify credentials: {e}")
-        return None
-
-async def execute_trade(token_id, leader_side, leader_price, leader_size):
-    poly_client = get_poly_client()
-    cfg = bot_state.config
-    
+async def execute_trade(poly_client, bot, token_id, leader_side, leader_price, leader_size, config):
     leader_value_usdc = leader_price * leader_size
-    trade_amount_usdc = cfg["FIXED_AMOUNT"] if cfg["TRADE_MODE"] == "FIXED" else leader_value_usdc * (cfg["PERCENTAGE"] / 100.0)
-    trade_amount_usdc = min(trade_amount_usdc, cfg["MAX_COPY_AMOUNT"])
+    trade_amount_usdc = config["FIXED_AMOUNT"] if config["TRADE_MODE"] == "FIXED" else leader_value_usdc * (config["PERCENTAGE"] / 100.0)
+    trade_amount_usdc = min(trade_amount_usdc, config["MAX_COPY_AMOUNT"])
 
     if leader_side == "BUY":
         my_side = Side.BUY
-        my_price = min(0.99, round(leader_price * (1 + cfg["SLIPPAGE_TOLERANCE"]), 2))
+        my_price = min(0.99, round(leader_price * (1 + config["SLIPPAGE_TOLERANCE"]), 2))
     else:
         my_side = Side.SELL
-        my_price = max(0.01, round(leader_price * (1 - cfg["SLIPPAGE_TOLERANCE"]), 2))
+        my_price = max(0.01, round(leader_price * (1 - config["SLIPPAGE_TOLERANCE"]), 2))
 
     trade_size_shares = calculate_clean_shares(price=my_price, target_usdc=trade_amount_usdc)
-    bot_state.log(f"🤖 EXECUTING: {my_side.name} {trade_size_shares} shares @ ${my_price}")
-    
-    current_total = bot_state.active_positions.get(token_id, {}).get("total", 0.0)
+    ui_print(f"🤖 EXECUTING: {my_side.name} {trade_size_shares} shares @ ${my_price}")
 
-    if current_total < 9:
-        try:
-            if not cfg["PAPER_TRADE"] and poly_client:
-                resp = await asyncio.to_thread(
-                    poly_client.create_and_post_order,
-                    OrderArgs(price=my_price, size=trade_size_shares, side=my_side, token_id=token_id),
-                    options=PartialCreateOrderOptions(tick_size="0.01"),
-                    order_type=OrderType.FOK
-                )
-                bot_state.log(f"✅ Trade Response: {resp.get('success', False)} | {resp.get('errorID', '')}")
-            else:
-                bot_state.log(f"✅ [PAPER] Trade Mocked Successfully!")
-            
-            if telegram_bot:
-                await telegram_bot.send_message(
-                    chat_id=os.getenv("MY_CHAT_ID"), 
-                    text=f"Traded {my_side.name} {trade_size_shares} @ ${my_price}"
-                )
-
-            # Update Positions mapping logic
-            if token_id not in bot_state.active_positions:
-                bot_state.active_positions[token_id] = {
-                    "cur_price": leader_price, "size": trade_size_shares, "entry_price": my_price,
-                    "total": trade_size_shares * my_price,
-                    "tp_price": min(0.99, round(my_price * (1 + cfg["TP_PERCENTAGE"]), 2)),
-                    "sl_price": max(0.01, round(my_price * (1 - cfg["SL_PERCENTAGE"]), 2)),
-                }
-            else:
-                pos = bot_state.active_positions[token_id]
-                new_size = pos["size"] + trade_size_shares
-                new_entry = ((pos["size"] * pos["entry_price"]) + (trade_size_shares * my_price)) / new_size
-                pos.update({
-                    "cur_price": leader_price, "size": new_size, "entry_price": round(new_entry, 4), "total": new_size * new_entry,
-                    "tp_price": min(0.99, round(new_entry * (1 + cfg["TP_PERCENTAGE"]), 2)),
-                    "sl_price": max(0.01, round(new_entry * (1 - cfg["SL_PERCENTAGE"]), 2))
-                })
-
-            save_active_positions()
-            if cfg["ENABLE_TAKE_PROFIT"] and my_side.name == "BUY" and poly_client:
-                await setup_tp(poly_client, token_id, bot_state.active_positions[token_id]["tp_price"], trade_size_shares)
-
-        except Exception as e:
-            bot_state.log(f"❌ Execution Failed: {e}")
-    else:
-        bot_state.log("Cancelling trade order, limit for market reached!")
-
-async def setup_tp(poly_client, token_id, tp_price, size):
-    if not bot_state.config["PAPER_TRADE"]:
-        try:
-            await asyncio.to_thread(
-                poly_client.create_and_post_order,
-                OrderArgs(price=tp_price, size=size, side=Side.SELL, token_id=token_id),
-                options=PartialCreateOrderOptions(tick_size="0.01"),
-                order_type=OrderType.GTC
-            )
-            bot_state.log(f"✅ TP order placed at {tp_price}")
-        except Exception as e:
-            bot_state.log(f"❌ Failed to place TP order: {e}")
-
-async def execute_stop_loss(token_id, size, current_price):
-    poly_client = get_poly_client()
-    bot_state.log(f"🚨 EXECUTING STOP LOSS: Selling {size:.2f} shares of {token_id}")
-    sell_price = max(0.01, round(current_price * (1 - bot_state.config["SLIPPAGE_TOLERANCE"]), 2))
-    clean_size = calculate_clean_shares(price=sell_price, max_available_shares=size)
-
-    if not bot_state.config["PAPER_TRADE"] and poly_client:
-        try:
-            resp = await asyncio.to_thread(
-                poly_client.create_and_post_order,
-                OrderArgs(price=sell_price, size=clean_size, side=Side.SELL, token_id=token_id),
-                options=PartialCreateOrderOptions(tick_size="0.01"),
-                order_type=OrderType.FOK
-            )
-            if resp.get('success') and telegram_bot:
-                await telegram_bot.send_message(
-                    chat_id=os.getenv("MY_CHAT_ID"),
-                    text=f"🚨 <b>STOP-LOSS TRIGGERED</b>\n\nSold {clean_size:.4f} shares @ ~${sell_price:.2f}",
-                    parse_mode="HTML"
-                )
-        except Exception as e:
-            bot_state.log(f"❌ Stop Loss Execution Failed: {e}")
-    else:
-        bot_state.log(f"✅ [PAPER] Stop Loss executed for {token_id}!")
-
-async def update_positions_loop():
-    async with httpx.AsyncClient() as client:
-        while bot_state.is_running:
-            wallet = os.getenv("DEPOSIT_WALLET")
-            if not wallet:
-                await asyncio.sleep(5)
-                continue
-            params = {"user": wallet, "sizeThreshold": 0.1, "limit": 500, "sortBy": "TOKENS", "sortDirection": "DESC"}
-            try:
-                response = await client.get(POSITIONS_URL, params=params)
-                if response.status_code == 200:
-                    positions = response.json()
-                    for pos in positions:
-                        size, avg_price, cur_price, asset = float(pos.get("size", 0)), float(pos.get("avgPrice", 0)), float(pos.get("curPrice", 0)), pos.get("asset")
-                        if size <= 0 or cur_price <= 0: continue
-                        
-                        price_drop_pct = ((avg_price - cur_price) / avg_price) * 100 if avg_price > 0 else 0
-                        
-                        bot_state.active_positions[asset] = {
-                            "cur_price": cur_price, "size": size, "entry_price": avg_price, "total": size * avg_price,
-                            "tp_price": min(0.99, round(avg_price * (1 + bot_state.config["TP_PERCENTAGE"]), 2)),
-                            "sl_price": max(0.01, round(avg_price * (1 - bot_state.config["SL_PERCENTAGE"]), 2)),
-                        }
-                        if bot_state.config["ENABLE_STOP_LOSS"] and price_drop_pct >= (bot_state.config["SL_PERCENTAGE"] * 100):
-                            await execute_stop_loss(asset, size, cur_price)
-                    
-                    for asset in list(bot_state.active_positions.keys()):
-                        if not any(p.get("asset") == asset for p in positions):
-                            bot_state.active_positions.pop(asset, None)
-                    save_active_positions()
-            except Exception as e:
-                bot_state.log(f"⚠️ Error updating loop positions: {e}")
-            await asyncio.sleep(15)
-
-async def monitor_global_bets_loop():
-    if not TARGET_WALLETS:
-        bot_state.log("⚠️ No targeting configuration found. Check JSON files.")
+    if config["PAPER_TRADE"]:
+        ui_print(f"✅ [PAPER TRADE] Successfully simulated {my_side.name} position.")
+        if bot:
+            try: await asyncio.to_thread(bot.send_message, chat_id=os.getenv("MY_CHAT_ID"), text=f"✨ [PAPER] Traded {my_side.name} {trade_size_shares} @ ${my_price}")
+            except Exception: pass
         return
-    while bot_state.is_running:
+
+    if not poly_client:
+        ui_print("❌ Execution aborted: CLOB client uninitialized.")
+        return
+
+    try:
+        resp = await asyncio.to_thread(
+            poly_client.create_and_post_order,
+            OrderArgs(price=my_price, size=trade_size_shares, side=my_side, token_id=token_id),
+            options=PartialCreateOrderOptions(tick_size="0.01"),
+            order_type=OrderType.FOK
+        )
+        ui_print(f"✅ Trade Response: {resp.get('success', False)}")
+        if bot:
+            await asyncio.to_thread(bot.send_message, chat_id=os.getenv("MY_CHAT_ID"), text=f"🎯 Live Order Posted: {my_side.name} {trade_size_shares} @ ${my_price}")
+    except Exception as e:
+        ui_print(f"❌ Execution Failed: {e}")
+
+async def send_heartbeat(websocket):
+    while state.get_running():
         try:
+            await websocket.send("PING")
+            await asyncio.sleep(5)
+        except Exception:
+            break
+
+async def monitor_global_bets(poly_client, bot, config, target_wallets):
+    while state.get_running():
+        try:
+            ui_print("Connecting to Polymarket WebSocket Stream...")
             async with websockets.connect(WSS_URL) as websocket, httpx.AsyncClient() as client:
-                await websocket.send(json.dumps({"action": "subscribe", "subscriptions": [{"topic": "activity", "type": "trades"}]}))
-                bot_state.log("🚀 Realtime Websocket Listening...")
-                while bot_state.is_running:
+                asyncio.create_task(send_heartbeat(websocket))
+                subscribe_msg = {"action": "subscribe", "subscriptions": [{"topic": "activity", "type": "trades"}]}
+                await websocket.send(json.dumps(subscribe_msg))
+                ui_print("🚀 Connection Active! Monitoring customized wallets...")
+
+                while state.get_running():
                     message = await websocket.recv()
                     data = json.loads(message)
                     p = data.get("payload", {})
                     if not p: continue
-                    
-                    wallet, pseudonym = p.get("proxyWallet", "").lower(), p.get("pseudonym", "").lower()
-                    event_slug, market_slug, token_id = p.get("eventSlug"), p.get("slug"), p.get("asset")
-                    price, size, side = float(p.get("price", 0)), float(p.get("size", 0)), p.get("side", "").upper()
-                    
+
+                    wallet = p.get("proxyWallet", "Unknown").lower()
+                    pseudonym = p.get("pseudonym", "").lower()
+                    event_slug = p.get("eventSlug")
+                    market_slug = p.get("slug")
+                    price = float(p.get("price", 0))
+                    size = float(p.get("size", 0))
+                    side = p.get("side", "").upper()
+                    token_id = p.get("asset")
+
                     combined_slug = f"{event_slug or ''} {market_slug or ''}".lower()
-                    if any(b in combined_slug for b in EXCLUDED_SLUGS): continue
-                    
-                    assigned_categories = TARGET_WALLETS.get(wallet) or TARGET_WALLETS.get(pseudonym)
-                    if assigned_categories is None or not event_slug: continue
-                    
+                    if any(b in combined_slug for b in config["EXCLUDED_SLUGS"]):
+                        continue
+
+                    assigned_categories = None
+                    matched_identity = None
+                    if wallet in target_wallets:
+                        assigned_categories = target_wallets[wallet]
+                        matched_identity = wallet
+                    elif pseudonym in target_wallets:
+                        assigned_categories = target_wallets[pseudonym]
+                        matched_identity = pseudonym
+
+                    if assigned_categories is None or not event_slug:
+                        continue
+
                     event_tags = await fetch_and_cache_gamma_data(client, event_slug)
-                    if not any(tag in assigned_categories for tag in event_tags): continue
-                    if bot_state.config["PRICE_MIN"] and price < bot_state.config["PRICE_MIN"]: continue
-                    if bot_state.config["PRICE_MAX"] and price > bot_state.config["PRICE_MAX"]: continue
-                    
-                    bot_state.log(f"🎯 MATCHED: {wallet or pseudonym} -> {side} {price}")
-                    asyncio.create_task(execute_trade(token_id, side, price, size))
+                    if not any(tag in assigned_categories for tag in event_tags):
+                        continue
+
+                    if (config["PRICE_MIN"] and price < config["PRICE_MIN"]) or (config["PRICE_MAX"] and price > config["PRICE_MAX"]):
+                        continue
+
+                    ui_print(f"🎯 TARGET MATCH: {matched_identity} -> {side} @ ${price}")
+                    asyncio.create_task(execute_trade(poly_client, bot, token_id, side, price, size, config))
+
         except Exception as e:
-            bot_state.log(f"⚠️ Socket broken, reconnecting: {e}")
+            ui_print(f"❌ Connection error: {e}. Reconnecting in 5 seconds...")
             await asyncio.sleep(5)
 
-# Thread execution orchestration
-def start_async_loop():
+def run_async_loop(poly_client, bot, config, target_wallets):
     loop = asyncio.new_event_loop()
-    bot_state.loop = loop
+    state.loop = loop
     asyncio.set_event_loop(loop)
+    
     loop.run_until_complete(load_active_positions())
-    loop.gather(monitor_global_bets_loop(), update_positions_loop())
+    loop. Jahn = loop.create_task(monitor_global_bets(poly_client, bot, config, target_wallets))
+    loop.create_task(update_positions(config))
+    
     loop.run_forever()
 
-def start_bot():
-    if not bot_state.is_running:
-        bot_state.is_running = True
-        bot_state.thread = threading.Thread(target=start_async_loop, daemon=True)
-        bot_state.thread.start()
-        bot_state.log("⚡ Copy Trader Engine Activated.")
-
-def stop_bot():
-    if bot_state.is_running:
-        bot_state.is_running = False
-        if bot_state.loop:
-            bot_state.loop.call_soon_threadsafe(bot_state.loop.stop)
-        bot_state.log("🛑 Copy Trader Engine Deactivated Safely.")
-
-
 # ==========================================
-# STREAMLIT USER INTERFACE LAYOUT
+# STREAMLIT USER INTERFACE
 # ==========================================
-st.title("🤖 Polymarket Copy-Trading Center")
-st.markdown("Monitor and control your wallet mirror replication algorithms instantly.")
+st.set_page_config(page_title="Polymarket Copy Trader Dash", page_icon="📈", layout="wide")
 
-# --- SIDEBAR CONTROL PANEL ---
-with st.sidebar:
-    st.header("🎛️ Engine Controller")
-    
-    # Start/Stop Buttons
-    if bot_state.is_running:
-        st.error("Bot Status: ACTIVE")
-        if st.button("Stop Trading Engine", use_container_width=True):
-            stop_bot()
-            st.rerun()
-    else:
-        st.warning("Bot Status: OFFLINE")
-        if st.button("Start Trading Engine", use_container_width=True, type="primary"):
-            start_bot()
-            st.rerun()
+st.title("📈 Polymarket Engine Control Room")
+st.markdown("---")
 
-    st.markdown("---")
-    st.header("🔑 Environment Setup")
-    
-    # Allow safe runtime configuration editing of .env values
-    with st.expander("Edit API/Wallet Credentials"):
-        pk = st.text_input("EVM Private Key", value=os.getenv("EVM_PRIVATE", ""), type="password")
-        dw = st.text_input("Deposit Wallet Address", value=os.getenv("DEPOSIT_WALLET", ""))
-        tk = st.text_input("Telegram Bot Token", value=os.getenv("BOT_TOKEN", ""), type="password")
-        cid = st.text_input("Telegram Chat ID", value=os.getenv("MY_CHAT_ID", ""))
-        
-        if st.button("Save Credentials", use_container_width=True):
-            set_key(".env", "EVM_PRIVATE", pk)
-            set_key(".env", "DEPOSIT_WALLET", dw)
-            set_key(".env", "BOT_TOKEN", tk)
-            set_key(".env", "MY_CHAT_ID", cid)
-            st.success("Saved! Restart bot to apply changes.")
+# Initialize structural APIs safely
+telegram_token = os.getenv("BOT_TOKEN")
+bot = Bot(token=telegram_token) if telegram_token else None
 
-# --- MAIN DASHBOARD INTERFACE ---
-tab1, tab2, tab3 = st.tabs(["📊 Live Status Hub", "⚙️ Dynamic Configs", "📋 Target Database"])
+poly_client = None
+try:
+    if os.getenv("EVM_PRIVATE") and os.getenv("POLY_API_KEY"):
+        creds = ApiCreds(api_key=os.getenv("POLY_API_KEY"), api_secret=os.getenv("POLY_API_SECRET"), api_passphrase=os.getenv("POLY_API_PASSPHRASE"))
+        poly_client = ClobClient(host=CLOB_HOST, key=os.getenv("EVM_PRIVATE"), chain_id=137, signature_type=3, funder=os.getenv("DEPOSIT_WALLET", ""), creds=creds)
+except Exception as e:
+    st.sidebar.error(f"CLOB Initialization Failure: {e}")
 
-with tab1:
-    # Stat Cards
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Monitored Wallets Connected", len(TARGET_WALLETS))
-    m2.metric("Active Tracked Positions", len(bot_state.active_positions))
-    m3.metric("Execution Mode", bot_state.config["TRADE_MODE"])
-    m4.metric("Risk Guarding", "Simulated (Paper)" if bot_state.config["PAPER_TRADE"] else "Production Live")
+# Sidebar controls & Strategy Configurations
+st.sidebar.header("🛠️ Operational Strategies")
 
-    st.subheader("📈 Live Open Positions Tracker")
-    if bot_state.active_positions:
-        # Format dictionary matrix into pandas display
-        df = pd.DataFrame.from_dict(bot_state.active_positions, orient='index')
-        df.index.name = 'Token Asset Contract Address'
-        df = df.reset_index()
-        # Prettify display metrics
-        df['PnL %'] = ((df['cur_price'] - df['entry_price']) / df['entry_price'] * 100).round(2)
-        st.dataframe(df.style.map(
-            lambda v: 'color: #00cc66;' if v > 0 else 'color: #ff3333;', subset=['PnL %']
-        ), use_container_width=True)
-    else:
-        st.info("No active open positions currently found on smart contract tracking ledger.")
+trade_mode = st.sidebar.selectbox("Trade Amount Mode", ["FIXED", "PERCENTAGE"], index=0)
+fixed_amount = st.sidebar.number_input("Fixed Allocation Amount (USDC)", min_value=1.0, value=2.0, step=0.5)
+percentage_amount = st.sidebar.number_input("Percentage Trade Scale Allocation (%)", min_value=1.0, max_value=100.0, value=15.0)
+max_copy_amount = st.sidebar.number_input("Max Copy Boundary Guard Limit (USDC)", min_value=1.0, value=8.0)
 
-    # Live Logger Feed
-    st.subheader("📜 Real-Time Console Feed")
-    log_text = "\n".join(bot_state.logs[::-1])  # Show newest on top
-    st.text_area("Console logs", value=log_text, height=250, label_visibility="collapsed")
-    
-    # Auto-refresh helper button
-    if st.button("🔄 Force Interface Redraw"):
+st.sidebar.subheader("🎯 Market Boundaries")
+price_min = st.sidebar.slider("Min Acceptable Cost Price Limit", 0.01, 0.99, 0.50)
+price_max = st.sidebar.slider("Max Acceptable Cost Price Limit", 0.01, 0.99, 0.95)
+slippage_tolerance = st.sidebar.slider("Execution Slippage Buffer Protection", 0.00, 0.10, 0.01)
+
+st.sidebar.subheader("🛡️ Risk Parameters")
+paper_trade = st.sidebar.checkbox("Run Engine inside Paper Trade Sandbox Mode", value=True)
+enable_tp = st.sidebar.checkbox("Enable Take Profit orders", value=False)
+enable_sl = st.sidebar.checkbox("Enable Automated Stop Loss execution", value=True)
+tp_percentage = st.sidebar.number_input("Take Profit Target Boundary Scale Multiplier", value=0.90)
+sl_percentage = st.sidebar.number_input("Stop Loss Liquidation Drawdown Trigger", value=0.40)
+
+# Build Runtime Configuration Map
+current_config = {
+    "TRADE_MODE": trade_mode, "FIXED_AMOUNT": fixed_amount, "PERCENTAGE": percentage_amount,
+    "MAX_COPY_AMOUNT": max_copy_amount, "PRICE_MIN": price_min, "PRICE_MAX": price_max,
+    "SLIPPAGE_TOLERANCE": slippage_tolerance, "PAPER_TRADE": paper_trade, "ENABLE_TAKE_PROFIT": enable_tp,
+    "ENABLE_STOP_LOSS": enable_sl, "TP_PERCENTAGE": tp_percentage, "SL_PERCENTAGE": sl_percentage,
+    "EXCLUDED_SLUGS": ["updown-5m", "updown-15m"]
+}
+
+# Load Watchlists 
+target_wallets_raw = generate_wallet_config(["CRYPTO", "WEATHER"])
+target_wallets = {k.lower(): [tag.lower() for tag in v] for k, v in target_wallets_raw.items()}
+
+# Start/Stop Engine Buttons Actions
+st.sidebar.subheader("🕹️ Engine Process Monitor")
+if state.get_running():
+    if st.sidebar.button("🛑 Stop Copy Trading Bot Process", use_container_width=True):
+        ui_print("Attempting connection cycle tear-down gracefully...")
+        state.set_running(False)
+        if state.loop:
+            state.loop.call_soon_threadsafe(state.loop.stop)
+        st.rerun()
+else:
+    if st.sidebar.button("🚀 Ignition Run Trading System", use_container_width=True):
+        state.set_running(True)
+        ui_print("System Boot sequence initializing...")
+        state.thread = threading.Thread(
+            target=run_async_loop, 
+            args=(poly_client, bot, current_config, target_wallets), 
+            daemon=True
+        )
+        state.thread.start()
         st.rerun()
 
+# Layout Status Visual Badges Indicator Matrix Elements
+c1, c2, c3, c4 = st.columns(4)
+with c1:
+    st.metric(label="System Architecture Engine Status", value="ACTIVE RUNNING" if state.get_running() else "STOPPED IDLE")
+with c2:
+    st.metric(label="Operational Profile Mode Environment", value="Sandbox Paper-Trade" if paper_trade else "Production Mainnet Live")
+with c3:
+    st.metric(label="Tracked Configured Active Wallets Count", value=f"{len(target_wallets)} Wallets")
+with c4:
+    st.metric(label="Active Monitors Tracked Positions Counters", value=f"{len(state.active_positions)} Tokens")
+
+# Interface System Core Sections
+tab1, tab2, tab3 = st.tabs(["📊 Live Positions Monitor Tracker", "⚙️ Targets Distribution Profiles", "📜 Real-Time Stream Engine Consoles"])
+
+with tab1:
+    st.subheader("Current Active Inventory Portfolio Tracking Matrix")
+    if state.active_positions:
+        # Build interactive structured display table frame
+        display_data = []
+        with state.lock:
+            for k, v in state.active_positions.items():
+                display_data.append({
+                    "Asset Token ID Code": f"{k[:12]}...",
+                    "Current Price Token Value": f"${v.get('cur_price', 0):.2f}",
+                    "Total Position Shares Owned Size": f"{v.get('size', 0):.2f}",
+                    "Average Inbound Weighted Entry Cost": f"${v.get('entry_price', 0):.2f}",
+                    "Total Exposure (USDC Value)": f"${v.get('total', 0):.2f}",
+                    "Performance Drawdowns Net Return": f"{v.get('pnl_pct', 0.0):+.2f}%"
+                })
+        st.dataframe(display_data, use_container_width=True)
+    else:
+        st.info("No tracking open exposures entries currently stored inside memory stack cache database frame mapping registries.")
+
 with tab2:
-    st.subheader("🛡️ Algorithmic Target Parameters")
-    st.markdown("Modify execution parameters dynamically. Changes apply to the next trade instantly.")
-    
-    c1, c2 = st.columns(2)
-    with c1:
-        bot_state.config["PAPER_TRADE"] = st.checkbox("Enable Paper Trading (Mock Fills)", value=bot_state.config["PAPER_TRADE"])
-        bot_state.config["TRADE_MODE"] = st.radio("Sizing Model Strategy", ["FIXED", "PERCENTAGE"], index=0 if bot_state.config["TRADE_MODE"] == "FIXED" else 1)
-        bot_state.config["FIXED_AMOUNT"] = st.number_input("Fixed Order Allocation Size ($ USDC)", min_value=1.0, value=float(bot_state.config["FIXED_AMOUNT"]))
-        bot_state.config["PERCENTAGE"] = st.slider("Percentage Mirror Scale Factor (%)", 1.0, 100.0, float(bot_state.config["PERCENTAGE"]))
-        bot_state.config["MAX_COPY_AMOUNT"] = st.number_input("Absolute Capital Cap Limit Per Trade ($ USDC)", min_value=1.0, value=float(bot_state.config["MAX_COPY_AMOUNT"]))
-    
-    with c2:
-        bot_state.config["PRICE_MIN"] = st.slider("Minimum Floor Execution Price ($)", 0.01, 0.99, float(bot_state.config["PRICE_MIN"]))
-        bot_state.config["PRICE_MAX"] = st.slider("Maximum Ceiling Execution Price ($)", 0.01, 0.99, float(bot_state.config["PRICE_MAX"]))
-        bot_state.config["SLIPPAGE_TOLERANCE"] = st.slider("Slippage Execution Buffer (%)", 0.005, 0.05, float(bot_state.config["SLIPPAGE_TOLERANCE"]), step=0.005)
-        
-        st.markdown("---")
-        bot_state.config["ENABLE_TAKE_PROFIT"] = st.checkbox("Automate Limit Take-Profit Offers", value=bot_state.config["ENABLE_TAKE_PROFIT"])
-        bot_state.config["TP_PERCENTAGE"] = st.slider("Take Profit Capture Target (%)", 0.1, 3.0, float(bot_state.config["TP_PERCENTAGE"]))
-        bot_state.config["ENABLE_STOP_LOSS"] = st.checkbox("Automate Monitoring Loop Stop-Loss Orders", value=bot_state.config["ENABLE_STOP_LOSS"])
-        bot_state.config["SL_PERCENTAGE"] = st.slider("Stop Loss Max Threshold Breach (%)", 0.05, 0.95, float(bot_state.config["SL_PERCENTAGE"]))
+    st.subheader("Configured Monitoring targets Profiles System Maps")
+    if target_wallets_raw:
+        st.json(target_wallets_raw)
+    else:
+        st.warning("Missing locally tracking profiles matching patterns! Please ensure file entities like `crypto_wallets.json` exist.")
 
 with tab3:
-    st.subheader("📋 Targeted Smart Contract Identity Ledger")
-    st.markdown("These identities are mapped based on target settings configured inside local `.json` category structures.")
+    st.subheader("Automated Streaming Kernel Event Engine Stream logs Console")
     
-    if TARGET_WALLETS:
-        wallet_display_data = [{"Address/Identity": wallet, "Subscribed Channels": ", ".join(tags).upper()} for wallet, tags in TARGET_WALLETS.items()]
-        st.table(pd.DataFrame(wallet_display_data))
-    else:
-        st.error("No tracked categories parsed successfully. Check that `crypto_wallets.json` or `weather_wallets.json` files are present in the directory execution root.")
+    # Auto-refresh helper block trigger UI element logic
+    if state.get_running():
+        st.caption("🔄 Live-streaming pipeline console updating window blocks...")
+    
+    log_text = "\n".join(state.logs[::-1])  # Keep newest log strings showing up top
+    st.text_area(label="Active Event Streaming Terminal Buffers Output Logs View", value=log_text, height=450)
+    
+    # Simple automated rerun tick trick trigger mechanism
+    if state.get_running():
+        asyncio.run(asyncio.sleep(1.5))
+        st.rerun()

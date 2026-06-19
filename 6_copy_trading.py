@@ -435,86 +435,114 @@ async def monitor_global_bets():
         print("⚠️ No TARGET_WALLETS configured!")
         return
 
-    async with websockets.connect(WSS_URL) as websocket, httpx.AsyncClient() as client:
-        asyncio.create_task(send_heartbeat(websocket))
-
-        subscribe_msg = {
-            "action": "subscribe",
-            "subscriptions": [{"topic": "activity", "type": "trades"}]
-        }
-        await websocket.send(json.dumps(subscribe_msg))
-        print(f"🚀 Connected! Monitoring customized specialized wallets.")
-
-        await telegram_bot.send_message(
-            chat_id=os.getenv("MY_CHAT_ID"), 
-            text=f"🚀 Copy trading initiated for configurated wallets!"
-        )
-
-        while True:
-            try:
-                message = await websocket.recv()
+    # OUTER LOOP: Handles full reconnections when the websocket drops
+    while True:
+        try:
+            # We add standard ping_interval to let the library help manage the connection
+            async with websockets.connect(WSS_URL, ping_interval=20, ping_timeout=20) as websocket, httpx.AsyncClient() as client:
                 
-                data = json.loads(message)
+                # Start your custom heartbeat
+                heartbeat_task = asyncio.create_task(send_heartbeat(websocket))
 
-                p = data.get("payload", {})
-                if not p:
-                    continue
+                subscribe_msg = {
+                    "action": "subscribe",
+                    "subscriptions": [{"topic": "activity", "type": "trades"}]
+                }
+                await websocket.send(json.dumps(subscribe_msg))
+                print(f"🚀 Connected! Monitoring customized specialized wallets.")
 
-                wallet = p.get("proxyWallet", "Unknown").lower()
-                pseudonym = p.get("pseudonym", "").lower()
-                event_slug = p.get("eventSlug")
-                market_slug = p.get("slug")
-                outcome = p.get("outcome")
-                price = float(p.get("price", 0))
-                size = float(p.get("size", 0))
-                side = p.get("side", "").upper()
-                token_id = p.get("asset")
+                await telegram_bot.send_message(
+                    chat_id=os.getenv("MY_CHAT_ID"), 
+                    text=f"🚀 Copy trading initiated for configurated wallets!"
+                )
 
-                combined_slug_string = f"{event_slug or ''} {market_slug or ''}".lower()
-                if any(blacklisted in combined_slug_string for blacklisted in EXCLUDED_SLUGS):
-                    continue
+                # INNER LOOP: Handles message processing
+                while True:
+                    try:
+                        # WATCHDOG: Force a timeout if nothing is received for 60 seconds.
+                        # (Adjust the 60.0 to be slightly longer than the market's quietest expected period)
+                        message = await asyncio.wait_for(websocket.recv(), timeout=60.0)
+                        
+                        # 1. Handle Application-Level PING/PONG (Crucial for keeping Polymarket happy)
+                        if message == "PING":
+                            await websocket.send("PONG")
+                            continue
+                        elif message == "PONG":
+                            continue
 
-                # 2. Target Wallet Filter Verification
-                assigned_categories = None
-                matched_identity = None
+                        # 2. Process JSON payload
+                        data = json.loads(message)
 
-                if wallet in TARGET_WALLETS:
-                    assigned_categories = TARGET_WALLETS[wallet]
-                    matched_identity = wallet
-                elif pseudonym in TARGET_WALLETS:
-                    assigned_categories = TARGET_WALLETS[pseudonym]
-                    matched_identity = pseudonym
+                        p = data.get("payload", {})
+                        if not p:
+                            continue
 
-                if assigned_categories is None:
-                    continue
+                        wallet = p.get("proxyWallet", "Unknown").lower()
+                        pseudonym = p.get("pseudonym", "").lower()
+                        event_slug = p.get("eventSlug")
+                        market_slug = p.get("slug")
+                        outcome = p.get("outcome")
+                        price = float(p.get("price", 0))
+                        size = float(p.get("size", 0))
+                        side = p.get("side", "").upper()
+                        token_id = p.get("asset")
 
-                # 3. Category/Tag Matching Check
-                if not event_slug:
-                    continue
-                
-                event_tags = await fetch_and_cache_gamma_data(client, event_slug)
-                has_matching_category = any(tag in assigned_categories for tag in event_tags)
-                if not has_matching_category:
-                    continue
+                        combined_slug_string = f"{event_slug or ''} {market_slug or ''}".lower()
+                        if any(blacklisted in combined_slug_string for blacklisted in EXCLUDED_SLUGS):
+                            continue
 
-                # 4. Price Filter Check
-                if PRICE_MIN is not None and price < PRICE_MIN:
-                    continue
-                if PRICE_MAX is not None and price > PRICE_MAX:
-                    continue
+                        # Target Wallet Filter Verification
+                        assigned_categories = None
+                        matched_identity = None
 
-                print("-" * 50)
-                print(f"🎯 TARGET TRADE DETECTED: {matched_identity}")
-                print(f"📈 Market: {p.get('title', market_slug)}")
-                print(f"⚡ Action: {side} {outcome} @ ${price} (Size: {size})")
+                        if wallet in TARGET_WALLETS:
+                            assigned_categories = TARGET_WALLETS[wallet]
+                            matched_identity = wallet
+                        elif pseudonym in TARGET_WALLETS:
+                            assigned_categories = TARGET_WALLETS[pseudonym]
+                            matched_identity = pseudonym
 
-                asyncio.create_task(execute_trade(token_id, side, price, size))
-                    
-            except json.JSONDecodeError:
-                continue
-            except Exception as e:
-                print(f"⚠️ Connection Lost: {e}")
-                continue
+                        if assigned_categories is None:
+                            continue
+
+                        # Category/Tag Matching Check
+                        if not event_slug:
+                            continue
+                        
+                        event_tags = await fetch_and_cache_gamma_data(client, event_slug)
+                        has_matching_category = any(tag in assigned_categories for tag in event_tags)
+                        if not has_matching_category:
+                            continue
+
+                        # Price Filter Check
+                        if PRICE_MIN is not None and price < PRICE_MIN:
+                            continue
+                        if PRICE_MAX is not None and price > PRICE_MAX:
+                            continue
+
+                        print("-" * 50)
+                        print(f"🎯 TARGET TRADE DETECTED: {matched_identity}")
+                        print(f"📈 Market: {p.get('title', market_slug)}")
+                        print(f"⚡ Action: {side} {outcome} @ ${price} (Size: {size})")
+
+                        asyncio.create_task(execute_trade(token_id, side, price, size))
+                        
+                    except json.JSONDecodeError:
+                        continue
+                    except asyncio.TimeoutError:
+                        print("⚠️ Watchdog Timeout! No data received for 60 seconds. Forcing reconnect...")
+                        break  # Breaks inner loop, triggers outer loop to reconnect
+                    except websockets.exceptions.ConnectionClosed as e:
+                        print(f"⚠️ Websocket cleanly closed by server: {e}. Reconnecting...")
+                        break  # Breaks inner loop, triggers outer loop to reconnect
+
+        except Exception as e:
+            print(f"⚠️ Websocket Connection Error: {e}. Retrying in 5 seconds...")
+            await asyncio.sleep(5)
+        finally:
+            # Clean up the heartbeat task so we don't leak memory on reconnects
+            if 'heartbeat_task' in locals() and not heartbeat_task.done():
+                heartbeat_task.cancel()
 
 
 async def main():
