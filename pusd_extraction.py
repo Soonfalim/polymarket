@@ -2,14 +2,12 @@
 Only certain chains and tokens are supported. See /supported-assets for details
 '''
 import os
-import time
 import sys
 import requests
 from dotenv import load_dotenv
 from web3 import Web3
-from py_builder_relayer_client.client import RelayClient
-from py_builder_relayer_client.models import DepositWalletCall, TransactionType
-from py_builder_signing_sdk.config import BuilderApiKeyCreds, BuilderConfig
+from py_builder_relayer_client.models import DepositWalletCall
+from _func import make_relayer, wallet_batch
 
 load_dotenv()
 
@@ -29,38 +27,6 @@ w3 = Web3(Web3.HTTPProvider(POLYGON_RPC_URL))
 
 print(f"Your Polymarket Wallet: {DW}")
 print("-" * 50)
-
-# Helper functions to build and execute the relayer batch from your reference code
-def make_relayer() -> RelayClient:
-    config = BuilderConfig(
-        local_builder_creds = BuilderApiKeyCreds(
-            key = os.getenv("BUILDER_API_KEY"),
-            secret = os.getenv("BUILDER_SECRET"),
-            passphrase = os.getenv("BUILDER_PASS_PHRASE"),
-        )
-    )
-    return RelayClient(
-        "https://relayer-v2.polymarket.com/",
-        137,
-        os.getenv("EVM_PRIVATE"),
-        config,
-    )
-
-def wallet_batch(relayer: RelayClient, deposit_wallet: str, calls: list) -> object:
-    nonce_payload = relayer.get_nonce(
-        relayer.signer.address(),
-        TransactionType.WALLET.value,
-    )
-    nonce    = str(nonce_payload["nonce"])
-    deadline = str(int(time.time()) + 3600)
-
-    response = relayer.execute_deposit_wallet_batch(
-        calls=calls,
-        wallet_address=deposit_wallet,
-        nonce=nonce,
-        deadline=deadline,
-    )
-    return response.wait()
 
 # ===============================================================
 # Step 1: Request your withdrawal address from the Bridge API

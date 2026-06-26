@@ -1,3 +1,6 @@
+# ============================================
+# WIP Issue: no resolved market is appearing
+# ============================================
 import asyncio
 import websockets
 import json
@@ -55,7 +58,6 @@ async def monitor_market_resolutions():
                 event_type = data.get("event_type")
 
                 # Target 'market_resolved' events specifically
-                print(event_type)
                 condition_id = data.get("market")
                 winning_asset_id = data.get("winning_asset_id")
                 winning_outcome = data.get("winning_outcome")

@@ -1,10 +1,10 @@
 import os
+import math
 import asyncio
 import websockets
-import requests
 import json
 import httpx
-from datetime import datetime
+from decimal import Decimal, ROUND_DOWN  # Added for exact decimal manipulation for FOK orders
 from dotenv import load_dotenv
 from telegram import Bot
 
@@ -24,15 +24,6 @@ telegram_bot = Bot(token=os.getenv("BOT_TOKEN"))
 # ==========================================
 # COPY TRADER CONFIGURATION
 # ==========================================
-
-# 1. Target Wallets & Categories Mapping
-# Custom wallets config
-"""TARGET_WALLETS_CONFIG = {
-    "0x36901eb0f21519cc9055662a6d2483e96da1e16f": ["Sports", "Crypto", "Politics"],
-    "0x81f80ba4769f17d270f0585ea546f2ed942e8ba9": ["Weather"],
-    "0xba016b05c84c9f073e5c9059d247d37cea4b8535": ["Crypto"],
-}"""
-
 # Leaderboard wallets config
 def generate_wallet_config(categories):
     target_wallets_config = {}
@@ -40,7 +31,6 @@ def generate_wallet_config(categories):
     print(f"Generating config dictionary for categories: {categories}\n")
 
     for category in categories:
-        # Standardize the label case (e.g., 'crypto' -> 'Crypto')
         label = category.capitalize()
         json_source = f"{category}_wallets.json"
 
@@ -49,10 +39,8 @@ def generate_wallet_config(categories):
                 wallets = json.load(f)
 
             for wallet in wallets:
-                # Lowercase the address to ensure standard consistency
                 wallet_clean = wallet.lower()
 
-                # If the wallet somehow exists in an already loaded category, append the new label
                 if wallet_clean in target_wallets_config:
                     if label not in target_wallets_config[wallet_clean]:
                         target_wallets_config[wallet_clean].append(label)
@@ -66,48 +54,44 @@ def generate_wallet_config(categories):
 
     return target_wallets_config
 
-TARGET_WALLETS_CONFIG = generate_wallet_config(["CRYPTO", "WEATHER", "SPORTS"])
+TARGET_WALLETS_CONFIG = generate_wallet_config(["CRYPTO", "WEATHER"])
 
-# Normalize configuration to lowercase for robust matching
 TARGET_WALLETS = {k.lower(): [tag.lower() for tag in v] for k, v in TARGET_WALLETS_CONFIG.items()}
 
-# 2. Trade Sizing ("FIXED" or "PERCENTAGE")
 TRADE_MODE = "FIXED" 
-FIXED_AMOUNT = 4.0   # Buy exactly 4 USD per trade
-PERCENTAGE = 15.0    # If mode is PERCENTAGE, buy 15% of the leader's trade size
+FIXED_AMOUNT = 2.0
+PERCENTAGE = 15.0
 
-# 3. Maximum Copy $ Amount (Hard cap per trade in pUSD)
-MAX_COPY_AMOUNT = 13.0
+MAX_COPY_AMOUNT = 8.0
 
-# 4. Price Range Filter (Inclusive)
-PRICE_MIN = 0.45
-PRICE_MAX = 0.96
+PRICE_MIN = 0.50
+PRICE_MAX = 0.95
 
-# 5. Slippage Tolerance (0.01 = 1% price movement accepted)
 SLIPPAGE_TOLERANCE = 0.01
 
-# 6. Automatic Take Profit & Stop Loss
-ENABLE_TAKE_PROFIT = True
+ENABLE_TAKE_PROFIT = False
 ENABLE_STOP_LOSS = True
 
-TP_PERCENTAGE = 0.90     # 20% gain
-SL_PERCENTAGE = 0.50     # 10% loss
+TP_PERCENTAGE = 0.90
+SL_PERCENTAGE = 0.40
 
-PAPER_TRADE = True
+PAPER_TRADE = False
 
-# ==========================================
-# ENDPOINTS & PERSISTENT STATE STORAGE
-# ==========================================
+EXCLUDED_SLUGS = [
+    "btc-updown-5m", "eth-updown-5m", "sol-updown-5m", "xrp-updown-5m", "doge-updown-5m", "hype-updown-5m", "bnb-updown-5m",
+    "btc-updown-15m", "eth-updown-15m", "sol-updown-15m", "xrp-updown-15m", "doge-updown-15m", "hype-updown-15m", "bnb-updown-15m"
+]
 
 WSS_URL = "wss://ws-live-data.polymarket.com"
 GAMMA_API_URL = "https://gamma-api.polymarket.com/events?slug="
 POSITIONS_URL = "https://data-api.polymarket.com/positions"
 CLOB_HOST = "https://clob.polymarket.com"
-DB_FILE = "active_positions.json"  # Persistent local state database
+DB_FILE = "active_positions.json"  
 
-event_cache = {}       # Caches event_slug -> list of lowercased tags
-active_positions = {}  # Tracks SL per token: token_id -> {"size": size, "sl_price": price}
+event_cache = {}       
+active_positions = {}  
 
+# Get your position from active_positions.json (to prevent over copytrade on a single market)
 async def load_active_positions():
     """Loads active tracking positions from the local JSON database file upon startup."""
     global active_positions
@@ -118,16 +102,15 @@ async def load_active_positions():
             print(f"💾 Database: Loaded {len(active_positions)} active position trackers from {DB_FILE}")
         except Exception as e:
             print(f"⚠️ Database Error: Failed to parse storage file, starting clean: {e}")
-    
-    update_positions()
 
 
+# Periodically update your positions using API and check for stop loss
 async def update_positions():
     async with httpx.AsyncClient() as client:
         while True:
             params = {
                 "user": os.getenv("DEPOSIT_WALLET"),
-                "sizeThreshold": 0.1,  # Lowered slightly to catch smaller fractional shares
+                "sizeThreshold": 0.1,  
                 "limit": 500,
                 "sortBy": "TOKENS",
                 "sortDirection": "DESC"
@@ -149,15 +132,12 @@ async def update_positions():
                     cur_price = float(pos.get("curPrice", 0))
                     asset = pos.get("asset")
 
-                    if size <= 0 or avg_price <= 0:
+                    if size <= 0 or cur_price <= 0:
                         continue
 
                     tp_price = min(0.99, round(avg_price * (1 + TP_PERCENTAGE), 2))
                     sl_price = max(0.01, round(avg_price * (1 - SL_PERCENTAGE), 2))
 
-                    # ==========================================
-                    # ACTIVE STOP-LOSS MONITORING LOGIC
-                    # ==========================================
                     price_drop_pct = ((avg_price - cur_price) / avg_price) * 100 if avg_price > 0 else 0
 
                     if price_drop_pct >= (SL_PERCENTAGE * 100):
@@ -181,23 +161,24 @@ async def update_positions():
                         "sl_price": sl_price,
                     }
 
-                    # Trigger execution if Stop Loss is active and threshold is breached
                     if ENABLE_STOP_LOSS and price_drop_pct >= (SL_PERCENTAGE * 100):
                         await execute_stop_loss(asset, size, cur_price)
                 
-                # Cleanup closed/empty positions
                 for asset, data in list(active_positions.items()):
                     if float(data.get("size", 0)) <= 0:
                         active_positions.pop(asset, None)
                 
                 save_active_positions()
 
-            except requests.exceptions.RequestException as e:
-                print(f"⚠️ Error fetching positions: {e}")
+            except httpx.HTTPError as e:
+                print(f"⚠️ Network error fetching positions: {e}")
+            except Exception as e:
+                print(f"⚠️ Unexpected error in update_positions: {e}")
             
             await asyncio.sleep(15)
         
 
+# Save position on the script to active_positions.json
 def save_active_positions():
     """Commits current tracking configuration safely to disk."""
     try:
@@ -206,7 +187,8 @@ def save_active_positions():
     except Exception as e:
         print(f"⚠️ Database Error: Could not save positions to disk: {e}")
 
-# Initialize CLOB Client
+
+# initiate clob client to trade
 try:
     creds = ApiCreds(
         api_key=os.getenv("POLY_API_KEY", ""),
@@ -227,9 +209,38 @@ except Exception as e:
     poly_client = None
 
 
+# For FOK clob orders
+def calculate_clean_shares(price, target_usdc=None, max_available_shares=None):
+    """
+    Calculates the maximum safe share size (max 4 decimals) for an FOK order
+    ensuring that (shares * price) yields a product with <= 2 decimal places.
+    """
+    price_cents = int(round(price * 100))
+    if price_cents <= 0:
+        return 0.0
+        
+    price_dec = Decimal(price_cents) / 100
+    
+    if target_usdc is not None:
+        max_shares = (Decimal(str(target_usdc)) / price_dec).quantize(Decimal('0.0001'), rounding=ROUND_DOWN)
+    elif max_available_shares is not None:
+        max_shares = Decimal(str(max_available_shares)).quantize(Decimal('0.0001'), rounding=ROUND_DOWN)
+    else:
+        return 0.0
+        
+    S_max = int(max_shares * 10000)
+    
+    # FOK mathematical invariant check via GCD
+    step = 10000 // math.gcd(price_cents, 10000)
+    S = (S_max // step) * step
+    
+    return float(Decimal(S) / 10000)
+
+
 # ==========================================
 # CORE FUNCTIONS
 # ==========================================
+# Needed to filter which market we want to trade in (e.g. Crypto market only etc)
 async def fetch_and_cache_gamma_data(client, event_slug):
     """Single API call to fetch tags and token mappings for an event slug."""
     if event_slug in event_cache:
@@ -266,9 +277,8 @@ async def execute_trade(token_id, leader_side, leader_price, leader_size):
         my_side = Side.SELL
         my_price = max(0.01, round(leader_price * (1 - SLIPPAGE_TOLERANCE), 2))
 
-    trade_size_shares = round(trade_amount_usdc / my_price, 2)
-    if trade_size_shares <= 0:
-        return
+    # CHANGED: Replaced crude round() with clean math.gcd FOK precision calculation
+    trade_size_shares = calculate_clean_shares(price=my_price, target_usdc=trade_amount_usdc)
 
     print(f"🤖 EXECUTING: {my_side.name} {trade_size_shares} shares @ ${my_price}")
     
@@ -286,7 +296,7 @@ async def execute_trade(token_id, leader_side, leader_price, leader_size):
                         token_id=token_id
                     ),
                     options=PartialCreateOrderOptions(tick_size="0.01"),
-                    order_type=OrderType.FOK  # Changed from OrderType.GTC
+                    order_type=OrderType.FOK  
                 )
 
                 print(f"✅ Trade Response: {resp.get('success', False)} | {resp.get('errorID', '')}")
@@ -328,8 +338,6 @@ async def execute_trade(token_id, leader_side, leader_price, leader_size):
             
             if ENABLE_TAKE_PROFIT and my_side.name == "BUY":
                 await setup_tp(token_id, active_positions[token_id]["tp_price"], trade_size_shares)
-            if ENABLE_STOP_LOSS and my_side.name == "BUY":
-                await setup_sl(token_id, active_positions[token_id]["sl_price"], trade_size_shares)
 
         except Exception as e:
             print(f"❌ Execution Failed: {e}")
@@ -338,9 +346,6 @@ async def execute_trade(token_id, leader_side, leader_price, leader_size):
 
 
 async def setup_tp(token_id, tp_price, size):
-    # ==========================================
-    # TAKE PROFIT
-    # ==========================================
     if not PAPER_TRADE:
         try:
             tp_resp = await asyncio.to_thread(
@@ -372,16 +377,19 @@ async def execute_stop_loss(token_id, size, current_price):
     print(f"🚨 EXECUTING STOP LOSS: Selling {size:.2f} shares of {token_id}")
     print("=" * 60)
 
+    # Price slightly below current to ensure Fill-Or-Kill execution acts like a market sell
+    sell_price = max(0.01, round(current_price * (1 - SLIPPAGE_TOLERANCE), 2))
+    
+    # CHANGED: Clean the stop loss share size so the FOK close order doesn't cause a bad decimal error
+    clean_size = calculate_clean_shares(price=sell_price, max_available_shares=size)
+
     if not PAPER_TRADE:
         try:
-            # Price slightly below current to ensure Fill-Or-Kill execution acts like a market sell
-            sell_price = max(0.01, round(current_price * (1 - SLIPPAGE_TOLERANCE), 2))
-
             resp = await asyncio.to_thread(
                 poly_client.create_and_post_order,
                 OrderArgs(
                     price=sell_price,
-                    size=size,
+                    size=clean_size,
                     side=Side.SELL,
                     token_id=token_id
                 ),
@@ -394,7 +402,7 @@ async def execute_stop_loss(token_id, size, current_price):
             if resp.get('success'):
                 await telegram_bot.send_message(
                     chat_id=os.getenv("MY_CHAT_ID"), 
-                    text=f"🚨 <b>STOP-LOSS TRIGGERED</b>\n\nToken: <code>{token_id}</code>\nSold {size:.2f} shares @ ~${sell_price:.2f}",
+                    text=f"🚨 <b>STOP-LOSS TRIGGERED</b>\n\nToken: <code>{token_id}</code>\nSold {clean_size:.4f} shares @ ~${sell_price:.2f}",
                     parse_mode="HTML"
                 )
                 
@@ -404,113 +412,134 @@ async def execute_stop_loss(token_id, size, current_price):
         print(f"✅ [PAPER TRADE] Stop Loss successfully executed for {token_id}!")
 
 
-async def setup_sl(token_id, sl_price, size):
-    # ==========================================
-    # STOP LOSS REGISTRATION
-    # ==========================================
-    print(f"🛡️ Stop loss armed for {token_id[:8]}... (Monitoring loop active)")
-
-
 async def send_heartbeat(websocket):
     while True:
         try:
-            await websocket.send(json.dumps({"action": "ping"}))
-            await asyncio.sleep(10)
+            await websocket.send("PING")
+            await asyncio.sleep(5)
         except:
             break
 
-# ==========================================
-# WEBSOCKET LISTENER LOOP
-# ==========================================
+
 async def monitor_global_bets():
     if not TARGET_WALLETS:
         print("⚠️ No TARGET_WALLETS configured!")
         return
 
-    async with websockets.connect(WSS_URL) as websocket, httpx.AsyncClient() as client:
-        asyncio.create_task(send_heartbeat(websocket))
-
-        subscribe_msg = {
-            "action": "subscribe",
-            "subscriptions": [{"topic": "activity", "type": "trades"}]
-        }
-        await websocket.send(json.dumps(subscribe_msg))
-        print(f"🚀 Connected! Monitoring customized specialized wallets. (DB active updates armed)")
-
-        await telegram_bot.send_message(
-            chat_id=os.getenv("MY_CHAT_ID"), 
-            text=f"🚀 Copy trading initiated for configurated wallets!"
-        )
-
-        while True:
-            try:
-                message = await websocket.recv()
-                if not message.strip().startswith('{'):
-                    continue
+    while True:
+        try:
+            async with websockets.connect(WSS_URL, ping_interval=20, ping_timeout=20) as websocket, httpx.AsyncClient() as client:
                 
-                data = json.loads(message)
-                p = data.get("payload", {})
-                if not p:
-                    continue
+                # Start your custom heartbeat
+                heartbeat_task = asyncio.create_task(send_heartbeat(websocket))
 
-                wallet = p.get("proxyWallet", "Unknown").lower()
-                pseudonym = p.get("pseudonym", "").lower()
-                event_slug = p.get("eventSlug")
-                market_slug = p.get("slug")
-                outcome = p.get("outcome")
-                price = float(p.get("price", 0))
-                size = float(p.get("size", 0))
-                side = p.get("side", "").upper()
-                token_id = p.get("asset")
+                subscribe_msg = {
+                    "action": "subscribe",
+                    "subscriptions": [{"topic": "activity", "type": "trades"}]
+                }
+                await websocket.send(json.dumps(subscribe_msg))
+                print(f"🚀 Connected! Monitoring customized specialized wallets.")
 
-                # 2. Target Wallet Filter Verification
-                assigned_categories = None
-                matched_identity = None
+                await telegram_bot.send_message(
+                    chat_id=os.getenv("MY_CHAT_ID"), 
+                    text=f"🚀 Copy trading initiated for configurated wallets!"
+                )
 
-                if wallet in TARGET_WALLETS:
-                    assigned_categories = TARGET_WALLETS[wallet]
-                    matched_identity = wallet
-                elif pseudonym in TARGET_WALLETS:
-                    assigned_categories = TARGET_WALLETS[pseudonym]
-                    matched_identity = pseudonym
+                # INNER LOOP: Handles message processing
+                while True:
+                    try:
+                        # WATCHDOG: Force a timeout if nothing is received for 60 seconds.
+                        # (Adjust the 60.0 to be slightly longer than the market's quietest expected period)
+                        message = await asyncio.wait_for(websocket.recv(), timeout=60.0)
+                        
+                        # 1. Handle Application-Level PING/PONG (Crucial for keeping Polymarket happy)
+                        if message == "PING":
+                            await websocket.send("PONG")
+                            continue
+                        elif message == "PONG":
+                            continue
 
-                if assigned_categories is None:
-                    continue
+                        # 2. Process JSON payload
+                        data = json.loads(message)
 
-                # 3. Category/Tag Matching Check
-                if not event_slug:
-                    continue
-                
-                event_tags = await fetch_and_cache_gamma_data(client, event_slug)
-                has_matching_category = any(tag in assigned_categories for tag in event_tags)
-                if not has_matching_category:
-                    continue
+                        p = data.get("payload", {})
+                        if not p:
+                            continue
 
-                # 4. Price Filter Check
-                if PRICE_MIN is not None and price < PRICE_MIN:
-                    continue
-                if PRICE_MAX is not None and price > PRICE_MAX:
-                    continue
+                        wallet = p.get("proxyWallet", "Unknown").lower()
+                        pseudonym = p.get("pseudonym", "").lower()
+                        event_slug = p.get("eventSlug")
+                        market_slug = p.get("slug")
+                        outcome = p.get("outcome")
+                        price = float(p.get("price", 0))
+                        size = float(p.get("size", 0))
+                        side = p.get("side", "").upper()
+                        token_id = p.get("asset")
 
-                print("-" * 50)
-                print(f"🎯 TARGET TRADE DETECTED: {matched_identity}")
-                print(f"📈 Market: {p.get('title', market_slug)}")
-                print(f"⚡ Action: {side} {outcome} @ ${price} (Size: {size})")
+                        combined_slug_string = f"{event_slug or ''} {market_slug or ''}".lower()
+                        if any(blacklisted in combined_slug_string for blacklisted in EXCLUDED_SLUGS):
+                            continue
 
-                asyncio.create_task(execute_trade(token_id, side, price, size))
-                    
-            except json.JSONDecodeError:
-                continue
-            except Exception as e:
-                print(f"⚠️ Connection Lost: {e}")
-                continue
+                        # Target Wallet Filter Verification
+                        assigned_categories = None
+                        matched_identity = None
+
+                        if wallet in TARGET_WALLETS:
+                            assigned_categories = TARGET_WALLETS[wallet]
+                            matched_identity = wallet
+                        elif pseudonym in TARGET_WALLETS:
+                            assigned_categories = TARGET_WALLETS[pseudonym]
+                            matched_identity = pseudonym
+
+                        if assigned_categories is None:
+                            continue
+
+                        # Category/Tag Matching Check
+                        if not event_slug:
+                            continue
+                        
+                        event_tags = await fetch_and_cache_gamma_data(client, event_slug)
+                        has_matching_category = any(tag in assigned_categories for tag in event_tags)
+                        if not has_matching_category:
+                            continue
+
+                        # Price Filter Check
+                        if PRICE_MIN is not None and price < PRICE_MIN:
+                            continue
+                        if PRICE_MAX is not None and price > PRICE_MAX:
+                            continue
+
+                        print("-" * 50)
+                        print(f"🎯 TARGET TRADE DETECTED: {matched_identity}")
+                        print(f"📈 Market: {p.get('title', market_slug)}")
+                        print(f"⚡ Action: {side} {outcome} @ ${price} (Size: {size})")
+
+                        asyncio.create_task(execute_trade(token_id, side, price, size))
+                        
+                    except json.JSONDecodeError:
+                        continue
+                    except asyncio.TimeoutError:
+                        print("⚠️ Watchdog Timeout! No data received for 60 seconds. Forcing reconnect...")
+                        break  # Breaks inner loop, triggers outer loop to reconnect
+                    except websockets.exceptions.ConnectionClosed as e:
+                        print(f"⚠️ Websocket cleanly closed by server: {e}. Reconnecting...")
+                        break  # Breaks inner loop, triggers outer loop to reconnect
+
+        except Exception as e:
+            print(f"⚠️ Websocket Connection Error: {e}. Retrying in 5 seconds...")
+            await asyncio.sleep(5)
+        finally:
+            # Clean up the heartbeat task so we don't leak memory on reconnects
+            if 'heartbeat_task' in locals() and not heartbeat_task.done():
+                heartbeat_task.cancel()
 
 
 async def main():
-    # Run both your websocket listener and background tracker concurrently!
+    await load_active_positions()
+    
     await asyncio.gather(
         monitor_global_bets(),
-        load_active_positions()
+        update_positions()
     )
 
 
