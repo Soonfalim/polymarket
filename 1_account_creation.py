@@ -1,7 +1,5 @@
-import os
-from eth_account import Account #pip install web3 eth_account
-from py_clob_client_v2.client import ClobClient #pip install py-clob-client
-from py_clob_client_v2.clob_types import ApiCreds
+from eth_account import Account
+from py_clob_client_v2.client import ClobClient
 
 # 1. Create a new Ethereum Account
 def create_eth_account():
@@ -9,12 +7,12 @@ def create_eth_account():
     Account.enable_unaudited_hdwallet_features()
     new_acc = Account.create()
     
-    print("--- NEW ETHEREUM ACCOUNT CREATED ---")
+    print("--- NEW ETH ACCOUNT CREATED ---")
     print(f"Address: {new_acc.address}")
     print(f"Private Key: {new_acc.key.hex()}")
     return new_acc
 
-# 2. Link the account to Polymarket (Not needed for profile to be found in PolyMarket)
+# 2. Link the created eth account to Polymarket
 def link_to_polymarket(eth_account):
     host = "https://clob.polymarket.com"
     chain_id = 137  # Polygon Mainnet
@@ -30,7 +28,6 @@ def link_to_polymarket(eth_account):
 
     try:
         # This derives the L2 API Key, Secret, and Passphrase 
-        # by signing an EIP-712 message with the new ETH key
         creds = client.create_or_derive_api_creds()
         
         print("\n--- POLYMARKET API CREDENTIALS ---")

@@ -1,3 +1,6 @@
+# ======================================================
+# Create deposit address to add fund to deposit wallet
+# ======================================================
 '''
 Only certain chains and tokens are supported. See /supported-assets for details
 '''

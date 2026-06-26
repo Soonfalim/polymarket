@@ -1,12 +1,10 @@
 import os
-import math  # Added for GCD precision matching
+import math
 import asyncio
 import websockets
-import requests
 import json
 import httpx
-from datetime import datetime
-from decimal import Decimal, ROUND_DOWN  # Added for exact decimal manipulation
+from decimal import Decimal, ROUND_DOWN  # Added for exact decimal manipulation for FOK orders
 from dotenv import load_dotenv
 from telegram import Bot
 
@@ -84,10 +82,6 @@ EXCLUDED_SLUGS = [
     "btc-updown-15m", "eth-updown-15m", "sol-updown-15m", "xrp-updown-15m", "doge-updown-15m", "hype-updown-15m", "bnb-updown-15m"
 ]
 
-# ==========================================
-# ENDPOINTS & PERSISTENT STATE STORAGE
-# ==========================================
-
 WSS_URL = "wss://ws-live-data.polymarket.com"
 GAMMA_API_URL = "https://gamma-api.polymarket.com/events?slug="
 POSITIONS_URL = "https://data-api.polymarket.com/positions"
@@ -97,6 +91,7 @@ DB_FILE = "active_positions.json"
 event_cache = {}       
 active_positions = {}  
 
+# Get your position from active_positions.json (to prevent over copytrade on a single market)
 async def load_active_positions():
     """Loads active tracking positions from the local JSON database file upon startup."""
     global active_positions
@@ -109,6 +104,7 @@ async def load_active_positions():
             print(f"⚠️ Database Error: Failed to parse storage file, starting clean: {e}")
 
 
+# Periodically update your positions using API and check for stop loss
 async def update_positions():
     async with httpx.AsyncClient() as client:
         while True:
@@ -182,6 +178,7 @@ async def update_positions():
             await asyncio.sleep(15)
         
 
+# Save position on the script to active_positions.json
 def save_active_positions():
     """Commits current tracking configuration safely to disk."""
     try:
@@ -191,6 +188,7 @@ def save_active_positions():
         print(f"⚠️ Database Error: Could not save positions to disk: {e}")
 
 
+# initiate clob client to trade
 try:
     creds = ApiCreds(
         api_key=os.getenv("POLY_API_KEY", ""),
@@ -211,9 +209,7 @@ except Exception as e:
     poly_client = None
 
 
-# ==========================================
-# PRECISION UTILITY (FOK COMPLIANCE)
-# ==========================================
+# For FOK clob orders
 def calculate_clean_shares(price, target_usdc=None, max_available_shares=None):
     """
     Calculates the maximum safe share size (max 4 decimals) for an FOK order
@@ -244,6 +240,7 @@ def calculate_clean_shares(price, target_usdc=None, max_available_shares=None):
 # ==========================================
 # CORE FUNCTIONS
 # ==========================================
+# Needed to filter which market we want to trade in (e.g. Crypto market only etc)
 async def fetch_and_cache_gamma_data(client, event_slug):
     """Single API call to fetch tags and token mappings for an event slug."""
     if event_slug in event_cache:
@@ -341,8 +338,6 @@ async def execute_trade(token_id, leader_side, leader_price, leader_size):
             
             if ENABLE_TAKE_PROFIT and my_side.name == "BUY":
                 await setup_tp(token_id, active_positions[token_id]["tp_price"], trade_size_shares)
-            if ENABLE_STOP_LOSS and my_side.name == "BUY":
-                await setup_sl(token_id, active_positions[token_id]["sl_price"], trade_size_shares)
 
         except Exception as e:
             print(f"❌ Execution Failed: {e}")
@@ -417,10 +412,6 @@ async def execute_stop_loss(token_id, size, current_price):
         print(f"✅ [PAPER TRADE] Stop Loss successfully executed for {token_id}!")
 
 
-async def setup_sl(token_id, sl_price, size):
-    print(f"🛡️ Stop loss armed for {token_id[:8]}... (Monitoring loop active)")
-
-
 async def send_heartbeat(websocket):
     while True:
         try:
@@ -435,10 +426,8 @@ async def monitor_global_bets():
         print("⚠️ No TARGET_WALLETS configured!")
         return
 
-    # OUTER LOOP: Handles full reconnections when the websocket drops
     while True:
         try:
-            # We add standard ping_interval to let the library help manage the connection
             async with websockets.connect(WSS_URL, ping_interval=20, ping_timeout=20) as websocket, httpx.AsyncClient() as client:
                 
                 # Start your custom heartbeat

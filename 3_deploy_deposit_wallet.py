@@ -1,31 +1,8 @@
-import os
 from dotenv import load_dotenv
-
-from py_builder_relayer_client.client import RelayClient
-from py_builder_relayer_client.models import TransactionType
-from py_builder_signing_sdk.config import BuilderApiKeyCreds, BuilderConfig
-
-RELAYER_URL = os.environ.get("RELAYER_URL", "https://relayer-v2.polymarket.com/")
-CHAIN_ID    = int(os.environ.get("CHAIN_ID", "137"))
+from _func import make_relayer, CHAIN_ID
 
 # Load the variables from .env into the environment
 load_dotenv()
-
-def make_relayer() -> RelayClient:
-    """Build a RelayClient from env vars. Call after load_dotenv()."""
-    config = BuilderConfig(
-        local_builder_creds = BuilderApiKeyCreds(
-            key = os.getenv("BUILDER_API_KEY"),
-            secret = os.getenv("BUILDER_SECRET"),
-            passphrase = os.getenv("BUILDER_PASS_PHRASE"),
-        )
-    )
-    return RelayClient(
-        "https://relayer-v2.polymarket.com/",
-        137,
-        os.getenv("EVM_PRIVATE"),
-        config,
-    )
 
 relayer = make_relayer()
 

@@ -1,15 +1,13 @@
 import os
 from dotenv import load_dotenv
 from py_clob_client_v2.client import ClobClient
-from py_builder_relayer_client.client import RelayClient
-from py_builder_signing_sdk.config import BuilderConfig
-from py_builder_signing_sdk.sdk_types import BuilderApiKeyCreds
 from poly_web3 import PolyWeb3Service
+from _func import make_relayer
 
 load_dotenv()
 
-PRIVATE_KEY = os.environ.get("EVM_PRIVATE")
-FUNDER_ADDRESS = os.environ.get("DEPOSIT_WALLET")
+PRIVATE_KEY = os.getenv("EVM_PRIVATE")
+FUNDER_ADDRESS = os.getenv("DEPOSIT_WALLET")
 
 # 1. Initialize the official Polymarket CLOB Client
 client = ClobClient(
@@ -20,34 +18,13 @@ client = ClobClient(
     funder=FUNDER_ADDRESS      # Your deposit wallet
 )
 
-chain_id = 137
-
-RELAYER_URL = os.environ.get("RELAYER_URL", "https://relayer-v2.polymarket.com/")
-CHAIN_ID    = int(os.environ.get("CHAIN_ID", "137"))
-
-def make_relayer() -> RelayClient:
-    """Build a RelayClient from env vars. Call after load_dotenv()."""
-    config = BuilderConfig(
-        local_builder_creds = BuilderApiKeyCreds(
-            key = os.getenv("BUILDER_API_KEY"),
-            secret = os.getenv("BUILDER_SECRET"),
-            passphrase = os.getenv("BUILDER_PASS_PHRASE"),
-        )
-    )
-    return RelayClient(
-        "https://relayer-v2.polymarket.com/",
-        137,
-        os.getenv("EVM_PRIVATE"),
-        config,
-    )
-
 relayer = make_relayer()
 
 # 2. Initialize the PolyWeb3 service
 service = PolyWeb3Service(
     clob_client=client,
     relayer_client=relayer,
-    rpc_url="https://polygon-bor.publicnode.com",  # Swap with your preferred RPC if needed
+    rpc_url="https://polygon-bor.publicnode.com",
 )
 
 print(f"Scanning funder address {FUNDER_ADDRESS} for unredeemed winnings...")

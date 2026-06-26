@@ -63,4 +63,4 @@ def fetch_and_store_wallets(target_count=110, category="CRYPTO"):
 
 
 if __name__ == "__main__":
-    fetch_and_store_wallets(target_count=100, category="SPORTS")
+    fetch_and_store_wallets(target_count=100, category="SPORTS") # Able to change to other category. e.g. CRYPTO/WEATHER etc

@@ -1,11 +1,9 @@
 .env
-module_requirement
 tempCodeRunnerFile.py
 __pycache__
-reference
-_func.py
+.venv
 active_positions.json
 CRYPTO_wallets.json
 SPORTS_wallets.json
 WEATHER_wallets.json
-testing.py
+manual_sell.py
