@@ -7,6 +7,7 @@ import httpx
 from decimal import Decimal, ROUND_DOWN  # Added for exact decimal manipulation for FOK orders
 from dotenv import load_dotenv
 from telegram import Bot
+from redeem_winnings import redeem
 
 # Polymarket CLOB Client v2
 from py_clob_client_v2 import (
@@ -394,7 +395,7 @@ async def execute_stop_loss(token_id, size, current_price):
                     token_id=token_id
                 ),
                 options=PartialCreateOrderOptions(tick_size="0.01"),
-                order_type=OrderType.FOK 
+                order_type=OrderType.FAK 
             )
 
             print(f"✅ SL Trade Response: {resp.get('success', False)} | Error: {resp.get('errorID', 'None')}")
@@ -419,6 +420,12 @@ async def send_heartbeat(websocket):
             await asyncio.sleep(5)
         except:
             break
+
+
+async def redeemwinnings(client):
+    while True:
+        redeem(client)
+        await asyncio.sleep(900)
 
 
 async def monitor_global_bets():
@@ -539,7 +546,8 @@ async def main():
     
     await asyncio.gather(
         monitor_global_bets(),
-        update_positions()
+        update_positions(),
+        redeemwinnings(poly_client)
     )
 
 

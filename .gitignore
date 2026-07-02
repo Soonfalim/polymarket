@@ -7,3 +7,5 @@ CRYPTO_wallets.json
 SPORTS_wallets.json
 WEATHER_wallets.json
 manual_sell.py
+SKILL.md
+.env copy
